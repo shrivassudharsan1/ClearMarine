@@ -7,9 +7,7 @@ import { getInterceptionPoint } from '../lib/drift';
 import { computePacificLandfallDisplay, shouldShowSightingOnDashboard } from '../lib/landfall';
 import { driftSegmentsForMap } from '../lib/mapPath';
 import { formatCoordPair } from '../lib/coords';
-<<<<<<< HEAD
 import { classifyPickupMode, pickupBadgeClassName } from '../lib/pickupClassification';
-=======
 import {
   applyDeliveredSupplyOrders,
   insertSupplyOrder,
@@ -17,7 +15,6 @@ import {
   formatEtaHuman,
   formatCountdownTo,
 } from '../lib/supplyOrders';
->>>>>>> f848251 (timer addition)
 
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
