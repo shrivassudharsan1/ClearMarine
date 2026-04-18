@@ -23,13 +23,15 @@ function extractJSONArray(text) {
   return JSON.parse(t.slice(start, end + 1));
 }
 
-const DEBRIS_JSON_SCHEMA = `{"debris_type":"plastic","density_score":4,"density_label":"Moderate","estimated_volume":"unknown","confidence":"low","needs_more_info":true,"gemini_analysis":"short factual assessment; say what is unknown if evidence is weak"}
+const DEBRIS_JSON_SCHEMA = `{"debris_type":"plastic","density_score":4,"density_label":"Moderate","estimated_volume":"unknown","confidence":"medium","needs_more_info":false,"gemini_analysis":"short factual assessment"}
 Rules:
 - debris_type: plastic | fishing_gear | organic | chemical | mixed | unknown
-- density_label: Critical (8-10) | Dense (6-7) | Moderate (3-5) | Sparse (1-2) | Unverified (use when confidence is not high)
-- If the photo is unclear, or text notes are vague/empty, set confidence "low", needs_more_info true, density_label "Unverified", density_score 2-3, estimated_volume "unknown", debris_type "unknown" unless clearly stated.
-- Do NOT invent specific weights, dimensions, or volume. Use estimated_volume "unknown" unless you have a clear visual or textual basis; optional "~X" only with strong evidence.
-- severity (density_score) must align with visible/text evidence; when uncertain keep score ≤4.
+- density_label: Critical (8-10) | Dense (6-7) | Moderate (3-5) | Sparse (1-2) | Unverified (only when evidence is truly absent)
+- TEXT REPORTS: Read the reporter's words carefully. If they state size, material, and/or amount (including patterns like "size: small", "material: metal", "amount: 1", "one plastic bottle", "small net"), that IS sufficient detail — set needs_more_info false and assign a reasonable debris_type and moderate severity unless they describe a large patch or chemical hazard.
+- Set needs_more_info true ONLY when notes are empty, a single vague word (e.g. "trash"), or no describable object — not when size/material/count are given.
+- Photos: if image is unreadable/blurry, needs_more_info may be true; if clear, needs_more_info false.
+- Do NOT invent exact weights; estimated_volume can be "~1 item", "small pile", or "unknown" when not inferable.
+- severity must match stated scope (one small item → lower scores; large accumulation → higher).
 Respond ONLY with the JSON object, no other text.`;
 
 // Analyze a debris photo using vision model
@@ -50,6 +52,28 @@ ${DEBRIS_JSON_SCHEMA}`;
   });
   const parsed = extractJSON(response.choices[0].message.content);
   return normalizeDebrisAnalysis(parsed);
+}
+
+/** Detect when plain-text notes already contain enough structure (size/material/amount) so we don't block the user. */
+export function notesLookSufficient(notes) {
+  const t = (notes || '').trim();
+  if (t.length < 6) return false;
+  let hits = 0;
+  if (/\bsize\s*[:=]|\b(size|approx\.?|about|diameter|length)\b|(^|[\s,])\s*(tiny|small|medium|large|huge)\b|\d+\s*(cm|m|mm|ft|in|inch|inches|meters?)\b|\d+\s*x\s*\d+/i.test(t)) hits += 1;
+  if (/\bmaterial\s*[:=]|\b(plastic|metal|glass|wood|styrofoam|foam|rope|net|nets|fabric|rubber|aluminum|aluminium|paper|cardboard|mixed)\b/i.test(t)) hits += 1;
+  if (/\bamount\s*[:=]|\b(amount|quantity|count|pieces?|bottles?|cans?|bags?|items?)\b|\b(one|two|three|four|five|several|many|few|single|couple|\d+)\b/i.test(t)) hits += 1;
+  if (hits >= 2) return true;
+  if (t.length >= 40 && hits >= 1) return true;
+  return false;
+}
+
+function applyTextNotesHeuristic(notes, raw) {
+  if (!notesLookSufficient(notes)) return raw;
+  return {
+    ...raw,
+    needs_more_info: false,
+    confidence: raw.confidence === 'low' ? 'medium' : (raw.confidence || 'medium'),
+  };
 }
 
 function normalizeDebrisAnalysis(a) {
@@ -74,59 +98,87 @@ export async function analyzeDebrisText(notes, latitude, longitude) {
   const prompt = `You are a marine debris assessment AI.
 A reporter at coordinates ${latitude}, ${longitude} described this debris sighting:
 "${raw || 'No description provided'}"
-If the description lacks size, material, amount, or hazard detail, set needs_more_info true and confidence low; do not guess volume or high severity.
+Use every detail they gave (object type, size words, material, count). If they gave size OR material OR amount, the description is not "empty" — set needs_more_info false unless there is truly nothing to assess.
 ${DEBRIS_JSON_SCHEMA}`;
 
   const response = await groq.chat.completions.create({
     model: TEXT_MODEL,
     messages: [{ role: 'user', content: prompt }],
   });
-  const parsed = extractJSON(response.choices[0].message.content);
+  let parsed = extractJSON(response.choices[0].message.content);
+  parsed = applyTextNotesHeuristic(raw, parsed);
   return normalizeDebrisAnalysis(parsed);
 }
 
 // Crew assignment + interception suggestions
 export async function getCrewSuggestions({ sightings, vessels, assignments, pendingHandoffs = [] }) {
-  const prompt = `You are an ocean debris coordination AI for a cleanup agency.
+  const available = (vessels || []).filter((v) => v.status === 'available');
+  const availJson = JSON.stringify(available.map((v) => ({
+    id: v.id, name: v.name, zone: v.zone, fuel: v.fuel_level, capacity: v.capacity,
+  })));
+
+  const prompt = `You are the AI crew coordinator for ClearMarine (one operations center; vessels below are OUR fleet).
 Active debris sightings: ${JSON.stringify(sightings.map(s => ({ id: s.id, type: s.debris_type, density: s.density_label, score: s.density_score, lat: s.latitude, lon: s.longitude, status: s.status })))}
-Pending jurisdiction handoffs (for THIS agency to accept — use these ids for accept_handoff): ${JSON.stringify((pendingHandoffs || []).map(s => ({ handoff_id: s.id, id: s.id, from: s.source_jurisdiction, type: s.debris_type, density: s.density_label })))}
-Available vessels: ${JSON.stringify(vessels.map(v => ({ id: v.id, name: v.name, zone: v.zone, status: v.status, fuel: v.fuel_level, capacity: v.capacity })))}
-Current assignments: ${JSON.stringify(assignments.map(a => ({ vessel_id: a.vessel_id, sighting_id: a.sighting_id, status: a.status })))}
+Pending handoffs to accept (this desk): ${JSON.stringify((pendingHandoffs || []).map(s => ({ handoff_id: s.id, id: s.id, from: s.source_jurisdiction, type: s.debris_type, density: s.density_label })))}
+AVAILABLE vessels (status=available — ONLY these can be assigned; you MUST pick one by name and id): ${availJson || '[]'}
+Other vessels (deployed/maintenance — do NOT assign): ${JSON.stringify((vessels || []).filter(v => v.status !== 'available').map(v => ({ name: v.name, status: v.status })))}
+Assignments: ${JSON.stringify(assignments.map(a => ({ vessel_id: a.vessel_id, sighting_id: a.sighting_id, status: a.status })))}
+
+Rules:
+- For assign_vessel: text MUST name the exact vessel (e.g. "Send Ocean Guardian I to intercept…") and set vessel_id to that vessel's UUID from AVAILABLE list only.
+- If AVAILABLE is empty: do NOT use assign_vessel. Use action_type "none" with text explaining no hulls are ready (suggest freeing a vessel or waiting). Optionally suggest reorder_supply if supplies are low.
+- Prioritize highest-density sightings and nearest zone match to the debris lat/lon.
 
 Return ONLY a JSON array of exactly 3 action items, no markdown:
 [
-  {"text":"action description max 20 words","action_type":"assign_vessel","sighting_id":null,"vessel_id":null,"supply_id":null,"handoff_id":null},
-  {"text":"action description","action_type":"accept_handoff","sighting_id":null,"vessel_id":null,"supply_id":null,"handoff_id":null},
-  {"text":"action description","action_type":"reorder_supply","sighting_id":null,"vessel_id":null,"supply_id":null,"handoff_id":null}
+  {"text":"Send [VESSEL NAME] to …","action_type":"assign_vessel","sighting_id":null,"vessel_id":null,"supply_id":null,"handoff_id":null},
+  {"text":"…","action_type":"accept_handoff","sighting_id":null,"vessel_id":null,"supply_id":null,"handoff_id":null},
+  {"text":"…","action_type":"reorder_supply","sighting_id":null,"vessel_id":null,"supply_id":null,"handoff_id":null}
 ]
-action_type must be one of: assign_vessel, accept_handoff, reorder_supply, mark_cleared, none
-Set relevant _id fields to actual UUIDs from the data above. For accept_handoff set handoff_id to the pending handoff sighting id. If there are no pending handoffs, use action_type none or another relevant action. Prioritize critical density sightings and low fuel vessels.`;
+action_type: assign_vessel | accept_handoff | reorder_supply | mark_cleared | none
+Set sighting_id, vessel_id, handoff_id from the data above when relevant.`;
 
   const response = await groq.chat.completions.create({
     model: TEXT_MODEL,
     messages: [{ role: 'user', content: prompt }],
   });
   const raw = response.choices[0].message.content.trim();
+  let items;
   try {
-    return extractJSONArray(raw);
+    items = extractJSONArray(raw);
   } catch {
     try {
       const one = extractJSON(raw);
-      return Array.isArray(one) ? one : [one];
+      items = Array.isArray(one) ? one : [one];
     } catch {
-      return [{ text: raw.slice(0, 120), action_type: 'none', sighting_id: null, vessel_id: null, supply_id: null, handoff_id: null }];
+      items = [{ text: raw.slice(0, 120), action_type: 'none', sighting_id: null, vessel_id: null, supply_id: null, handoff_id: null }];
     }
   }
+
+  if (!Array.isArray(items)) items = [items];
+  if (available.length === 0) {
+    return items.map((row) => {
+      if (row && row.action_type === 'assign_vessel') {
+        return {
+          ...row,
+          action_type: 'none',
+          vessel_id: null,
+          text: 'No cleanup vessels are available — free a hull from deployment/maintenance or wait for a returning crew before assigning.',
+        };
+      }
+      return row;
+    });
+  }
+  return items;
 }
 
 // Generate jurisdiction handoff brief
 export async function generateHandoffBrief({ fromAgency, toAgency, debrisType, densityLabel, densityScore, analysis, lat, lon }) {
-  const prompt = `Debris cluster being handed off from ${fromAgency} to ${toAgency}.
+  const prompt = `ClearMarine ops is handing this case from ${fromAgency} to ${toAgency} (partner lane — same incident system).
 Location: ${lat}, ${lon}
 Type: ${debrisType}, Density: ${densityScore}/10 — ${densityLabel}
 Assessment: ${analysis}
-Generate a concise jurisdiction handoff brief for the receiving agency coordinator.
-Include: debris description, environmental risk, recommended vessel type, priority level.
+Brief for the receiving coordinator: debris, risk, suggested vessel class, priority.
 Max 100 words. Professional tone.`;
 
   const response = await groq.chat.completions.create({

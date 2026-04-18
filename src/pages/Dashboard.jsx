@@ -4,6 +4,7 @@ import L from 'leaflet';
 import { supabase } from '../lib/supabase';
 import { getCrewSuggestions, generateHandoffBrief, generateAssignmentBrief } from '../lib/gemini';
 import { getInterceptionPoint } from '../lib/drift';
+import { computePacificLandfallDisplay } from '../lib/landfall';
 
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -33,7 +34,8 @@ const landfallIcon = L.divIcon({
   iconAnchor: [9, 9],
 });
 
-const AGENCIES = ['Local Coastguard', 'EPA', 'NOAA', 'Navy'];
+/** One ops center; second row is a typical federal partner (hazmat / offshore rules), not a separate product. */
+const AGENCIES = ['ClearMarine Operations', 'EPA (partner)'];
 
 const densityBadge = (score, label) => {
   if (label === 'Unverified') return 'bg-slate-600 text-slate-100';
@@ -43,21 +45,20 @@ const densityBadge = (score, label) => {
   return 'bg-green-600 text-white';
 };
 
-// Approximate Pacific coast of N. America bounding
-function nearCoastInfo(lat, lon) {
-  // California/Oregon/Washington coast: ~lon -116 to -125, lat 32-50
-  if (lat > 30 && lat < 50 && lon > -125 && lon < -115) {
-    return `CA/OR coast ~${lat.toFixed(1)}°N`;
+function approxOnPath(lat, lon, pathPoints, eps = 0.025) {
+  return pathPoints.some(([la, lo]) => Math.abs(la - lat) < eps && Math.abs(lo - lon) < eps);
+}
+
+function driftSegmentPolylines(pathPoints) {
+  const colors = ['#eab308', '#f97316', '#ef4444'];
+  const segs = [];
+  for (let i = 0; i < pathPoints.length - 1; i += 1) {
+    segs.push({
+      positions: [pathPoints[i], pathPoints[i + 1]],
+      color: colors[Math.min(i, 2)],
+    });
   }
-  // Baja California
-  if (lat > 22 && lat < 32 && lon > -118 && lon < -109) {
-    return `Baja coast ~${lat.toFixed(1)}°N`;
-  }
-  // Hawaii
-  if (lat > 18 && lat < 23 && lon > -161 && lon < -154) {
-    return `Hawaii coast ~${lat.toFixed(1)}°N`;
-  }
-  return null;
+  return segs;
 }
 
 function formatCoordPair(lat, lng) {
@@ -101,13 +102,13 @@ export default function Dashboard() {
   const [briefModal, setBriefModal] = useState(null);
   const [selectedVessel, setSelectedVessel] = useState('');
   const [activeTab, setActiveTab] = useState('sightings');
-  const [myAgency, setMyAgency] = useState('Local Coastguard');
+  const [myAgency, setMyAgency] = useState('ClearMarine Operations');
   const [selectedSightingId, setSelectedSightingId] = useState(null);
   const [mapFlyTarget, setMapFlyTarget] = useState(null);
   const [hoverCoords, setHoverCoords] = useState(null);
   const [clickCoords, setClickCoords] = useState(null);
 
-  const myAgencyRef = useRef('Local Coastguard');
+  const myAgencyRef = useRef('ClearMarine Operations');
   const sightingRefs = useRef({});
   const sightingsDataRef = useRef([]);
   const vesselsDataRef = useRef([]);
@@ -276,8 +277,13 @@ export default function Dashboard() {
     setExecutingAction(idx);
     try {
       if (s.action_type === 'assign_vessel') {
+        const available = vessels.filter((v) => v.status === 'available');
+        if (available.length === 0) {
+          alert('No cleanup vessels are available right now. Free a hull from deployment or maintenance, then try again.');
+          return;
+        }
         const sighting = s.sighting_id ? sightings.find((x) => x.id === s.sighting_id) : sightings[0];
-        const vessel = s.vessel_id ? vessels.find((v) => v.id === s.vessel_id) : vessels.find((v) => v.status === 'available');
+        const vessel = s.vessel_id ? vessels.find((v) => v.id === s.vessel_id) : available[0];
         if (sighting && vessel) { setAssignModal(sighting); setSelectedVessel(vessel.id); }
       } else if (s.action_type === 'accept_handoff') {
         const h = s.handoff_id ? pendingHandoffs.find((x) => x.id === s.handoff_id) : pendingHandoffs[0];
@@ -313,6 +319,7 @@ export default function Dashboard() {
 
   const getDrift = (sightingId) => drifts.find((d) => d.sighting_id === sightingId);
   const lowSupplies = supplies.filter((s) => s.quantity <= s.low_threshold);
+  const availableFleet = vessels.filter((v) => v.status === 'available');
 
   const actionLabel = (type) => {
     if (type === 'assign_vessel') return 'Assign';
@@ -328,19 +335,22 @@ export default function Dashboard() {
         <span className="text-xl">🌊</span>
         <div>
           <h1 className="text-base font-bold text-white">ClearMarine — Coordination Center</h1>
-          <p className="text-slate-400 text-xs">Real-time debris tracking & crew dispatch</p>
+          <p className="text-slate-400 text-xs">ClearMarine fleet — one desk; hand off to EPA partner when needed</p>
         </div>
         <div className="flex items-center gap-2 ml-auto flex-wrap text-xs">
-          {/* Agency selector */}
+          {/* Role / partner lane (same app, different queue filter) */}
           <select
             value={myAgency}
             onChange={(e) => setMyAgency(e.target.value)}
             className="bg-slate-700 text-slate-200 text-xs rounded-lg px-2 py-1 border border-slate-600 focus:outline-none"
+            title="Same coordination app — switch which incoming handoffs you accept"
           >
             {AGENCIES.map((a) => <option key={a} value={a}>{a}</option>)}
           </select>
           <span className="text-slate-300">{sightings.length} active</span>
-          <span className="text-cyan-400">{vessels.filter((v) => v.status === 'available').length} ready</span>
+          <span className={availableFleet.length === 0 ? 'text-red-400 font-bold' : 'text-cyan-400'}>
+            {availableFleet.length} vessel{availableFleet.length === 1 ? '' : 's'} ready
+          </span>
           {pendingHandoffs.length > 0 && (
             <span className="bg-yellow-700 text-yellow-200 px-2 py-0.5 rounded-full font-bold">
               {pendingHandoffs.length} handoff{pendingHandoffs.length > 1 ? 's' : ''}
@@ -369,20 +379,18 @@ export default function Dashboard() {
 
             {sightings.map((s) => {
               const drift = getDrift(s.id);
-              const driftPoints = drift ? [
+              const lf = drift
+                ? computePacificLandfallDisplay(s.latitude, s.longitude, drift)
+                : { showLandfallFlag: false, landfallPoint: null, pathPoints: [], landfallLabel: null };
+              const pathPoints = lf.pathPoints.length > 0 ? lf.pathPoints : (drift ? [
                 [s.latitude, s.longitude],
                 [drift.lat_24h, drift.lon_24h],
                 [drift.lat_48h, drift.lon_48h],
                 [drift.lat_72h, drift.lon_72h],
-              ] : null;
+              ] : []);
+              const segmentPolylines = pathPoints.length >= 2 ? driftSegmentPolylines(pathPoints) : [];
               const isSelected = selectedSightingId === s.id;
-              const landfall72 = drift ? nearCoastInfo(drift.lat_72h, drift.lon_72h) : null;
-              const landfall48 = drift ? nearCoastInfo(drift.lat_48h, drift.lon_48h) : null;
-              const firstLandfall = landfall48 || landfall72;
-              const landfallPt = landfall48 ? [drift.lat_48h, drift.lon_48h] : drift ? [drift.lat_72h, drift.lon_72h] : null;
-              const landfallCoords = landfall48
-                ? formatCoordPair(drift.lat_48h, drift.lon_48h)
-                : (drift ? formatCoordPair(drift.lat_72h, drift.lon_72h) : null);
+              const landfallCoords = lf.landfallPoint ? formatCoordPair(lf.landfallPoint[0], lf.landfallPoint[1]) : null;
 
               return (
                 <div key={s.id}>
@@ -398,34 +406,41 @@ export default function Dashboard() {
                         <p className="text-gray-500">By: {s.reporter_name}</p>
                         <p className="text-gray-500">Vol: {s.estimated_volume}</p>
                         <p className="text-gray-400 font-mono text-xs">{formatCoordPair(s.latitude, s.longitude)}</p>
-                        {firstLandfall && (
+                        {lf.showLandfallFlag && lf.landfallLabel && (
                           <p className="text-orange-500 font-semibold">
-                            ⚑ If drift holds, nearest shoreline approach near {firstLandfall}
-                            {landfallCoords ? ` (${landfallCoords})` : ''}. Path is over open water (surface current), not over land.
+                            ⚑ {lf.landfallLabel}
+                            {landfallCoords ? ` — ${landfallCoords}` : ''}. Track stops at shore approach (not inland).
                           </p>
                         )}
                       </div>
                     </Popup>
                   </Marker>
 
-                  {driftPoints && (
+                  {segmentPolylines.map((seg, si) => (
+                    <Polyline key={`${s.id}-seg-${si}`} positions={seg.positions} color={seg.color} weight={2} dashArray="6,4" opacity={0.85} />
+                  ))}
+
+                  {drift && pathPoints.length > 0 && (
                     <>
-                      <Polyline positions={driftPoints.slice(0, 2)} color="#eab308" weight={2} dashArray="6,4" opacity={0.8} />
-                      <Polyline positions={driftPoints.slice(1, 3)} color="#f97316" weight={2} dashArray="6,4" opacity={0.8} />
-                      <Polyline positions={driftPoints.slice(2)} color="#ef4444" weight={2} dashArray="6,4" opacity={0.8} />
-                      <Circle center={[drift.lat_24h, drift.lon_24h]} radius={8000} color="#eab308" fillOpacity={0.1} weight={1} />
-                      <Circle center={[drift.lat_48h, drift.lon_48h]} radius={12000} color="#f97316" fillOpacity={0.1} weight={1} />
-                      <Circle center={[drift.lat_72h, drift.lon_72h]} radius={16000} color="#ef4444" fillOpacity={0.1} weight={1} />
+                      {approxOnPath(drift.lat_24h, drift.lon_24h, pathPoints) && (
+                        <Circle center={[drift.lat_24h, drift.lon_24h]} radius={8000} color="#eab308" fillOpacity={0.1} weight={1} />
+                      )}
+                      {approxOnPath(drift.lat_48h, drift.lon_48h, pathPoints) && (
+                        <Circle center={[drift.lat_48h, drift.lon_48h]} radius={12000} color="#f97316" fillOpacity={0.1} weight={1} />
+                      )}
+                      {approxOnPath(drift.lat_72h, drift.lon_72h, pathPoints) && (
+                        <Circle center={[drift.lat_72h, drift.lon_72h]} radius={16000} color="#ef4444" fillOpacity={0.1} weight={1} />
+                      )}
                     </>
                   )}
 
-                  {firstLandfall && landfallPt && (
-                    <Marker position={landfallPt} icon={landfallIcon}>
+                  {lf.showLandfallFlag && lf.landfallPoint && (
+                    <Marker position={lf.landfallPoint} icon={landfallIcon}>
                       <Popup>
-                        <p className="text-xs font-semibold text-orange-600">⚑ Coastal approach (forecast position)</p>
-                        <p className="text-xs text-gray-600">{firstLandfall}</p>
-                        <p className="text-xs text-gray-500 font-mono">{formatCoordPair(landfallPt[0], landfallPt[1])}</p>
-                        <p className="text-xs text-gray-500">Segment is over water per current model; flag marks where the track nears shore.</p>
+                        <p className="text-xs font-semibold text-orange-600">⚑ Shore approach (model)</p>
+                        <p className="text-xs text-gray-600">{lf.landfallLabel}</p>
+                        <p className="text-xs text-gray-500 font-mono">{formatCoordPair(lf.landfallPoint[0], lf.landfallPoint[1])}</p>
+                        <p className="text-xs text-gray-500">Shown only when the drift track leaves open ocean toward the coast. Path is not drawn inland.</p>
                       </Popup>
                     </Marker>
                   )}
@@ -450,11 +465,11 @@ export default function Dashboard() {
           {/* Coordinate display */}
           <div className="absolute bottom-4 left-4 bg-slate-900 bg-opacity-90 rounded-xl p-3 text-xs space-y-1 z-[1000] min-w-[200px] pointer-events-none">
             <p className="text-slate-400 font-semibold mb-1">Drift forecast</p>
-            <p className="text-slate-500 leading-snug mb-1">Polylines follow surface current over water (not a land crossing).</p>
+            <p className="text-slate-500 leading-snug mb-1">Track follows surface current; clipped at shore — not inland.</p>
             <div className="flex items-center gap-2"><div className="w-6 h-0.5 bg-yellow-400" /><span className="text-slate-300">24h</span></div>
             <div className="flex items-center gap-2"><div className="w-6 h-0.5 bg-orange-500" /><span className="text-slate-300">48h</span></div>
             <div className="flex items-center gap-2"><div className="w-6 h-0.5 bg-red-500" /><span className="text-slate-300">72h</span></div>
-            <div className="flex items-center gap-2"><span className="text-orange-400">⚑</span><span className="text-slate-300">Nearest coast approach</span></div>
+            <div className="flex items-center gap-2"><span className="text-orange-400">⚑</span><span className="text-slate-300">Shore only if track reaches coast</span></div>
             <div className="pt-1 border-t border-slate-700 mt-1 space-y-0.5">
               <p className="text-slate-500">Hover or click map</p>
               {hoverCoords && (
@@ -491,6 +506,9 @@ export default function Dashboard() {
                 {aiLoading ? '...' : 'Refresh'}
               </button>
             </div>
+            {availableFleet.length === 0 && (
+              <p className="text-amber-400 text-xs mb-2 leading-snug">No vessels available — AI cannot assign a hull until one is free.</p>
+            )}
             {aiSuggestions.length === 0 ? (
               <p className="text-slate-500 text-xs">Suggestions refresh after loads and live updates (~1s). Use Refresh to run again.</p>
             ) : (
@@ -544,12 +562,7 @@ export default function Dashboard() {
 
             {activeTab === 'sightings' && sightings.map((s) => {
               const drift = getDrift(s.id);
-              const landfall48 = drift ? nearCoastInfo(drift.lat_48h, drift.lon_48h) : null;
-              const landfall72 = drift ? nearCoastInfo(drift.lat_72h, drift.lon_72h) : null;
-              const landfall = landfall48 || landfall72;
-              const landfallPin = drift
-                ? (landfall48 ? formatCoordPair(drift.lat_48h, drift.lon_48h) : formatCoordPair(drift.lat_72h, drift.lon_72h))
-                : null;
+              const lfSide = drift ? computePacificLandfallDisplay(s.latitude, s.longitude, drift) : null;
               const isSelected = selectedSightingId === s.id;
               return (
                 <div
@@ -568,10 +581,9 @@ export default function Dashboard() {
                       </div>
                       <p className="text-slate-400 text-xs mt-1">{s.estimated_volume} · {s.reporter_name}</p>
                       <p className="text-slate-500 text-xs font-mono">{formatCoordPair(s.latitude, s.longitude)}</p>
-                      {landfall && (
+                      {lfSide?.showLandfallFlag && lfSide.landfallPoint && (
                         <p className="text-orange-400 text-xs mt-0.5">
-                          ⚑ If drift holds, shoreline approach near {landfall}
-                          {landfallPin ? ` (${landfallPin})` : ''}. Track stays over water (current model).
+                          ⚑ Shore approach: {lfSide.landfallLabel} ({formatCoordPair(lfSide.landfallPoint[0], lfSide.landfallPoint[1])}). Track clipped at coast in map view.
                         </p>
                       )}
                       <div className="flex gap-1 mt-1.5 flex-wrap">
@@ -581,7 +593,14 @@ export default function Dashboard() {
                       </div>
                     </div>
                     <div className="flex flex-col gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
-                      <button onClick={() => setAssignModal(s)} className="bg-cyan-700 hover:bg-cyan-600 text-white text-xs px-2 py-1 rounded-lg">Assign</button>
+                      <button
+                        onClick={() => setAssignModal(s)}
+                        disabled={availableFleet.length === 0}
+                        title={availableFleet.length === 0 ? 'No vessel available' : ''}
+                        className="bg-cyan-700 hover:bg-cyan-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs px-2 py-1 rounded-lg"
+                      >
+                        Assign
+                      </button>
                       <select
                         onChange={(e) => e.target.value && handleHandoff(s, e.target.value)}
                         value=""
@@ -647,17 +666,21 @@ export default function Dashboard() {
           <div className="bg-slate-800 rounded-2xl p-6 max-w-md w-full border border-slate-600 shadow-2xl">
             <h3 className="text-white font-bold text-lg mb-1">Assign Cleanup Crew</h3>
             <p className="text-slate-400 text-sm mb-4">{assignModal.density_label} {assignModal.debris_type?.replace('_', ' ')} cluster</p>
-            <select value={selectedVessel} onChange={(e) => setSelectedVessel(e.target.value)}
-              className="w-full bg-slate-700 text-white rounded-xl px-4 py-3 mb-4 focus:outline-none focus:ring-2 focus:ring-cyan-500">
-              <option value="">Select vessel...</option>
-              {vessels.filter((v) => v.status === 'available').map((v) => (
-                <option key={v.id} value={v.id}>{v.name} — {v.zone} (⛽ {v.fuel_level}%)</option>
-              ))}
-            </select>
+            {availableFleet.length === 0 ? (
+              <p className="text-amber-300 text-sm mb-4">No vessels in &quot;available&quot; status. Mark a crew as available or wait for a returning hull.</p>
+            ) : (
+              <select value={selectedVessel} onChange={(e) => setSelectedVessel(e.target.value)}
+                className="w-full bg-slate-700 text-white rounded-xl px-4 py-3 mb-4 focus:outline-none focus:ring-2 focus:ring-cyan-500">
+                <option value="">Select vessel...</option>
+                {availableFleet.map((v) => (
+                  <option key={v.id} value={v.id}>{v.name} — {v.zone} (⛽ {v.fuel_level}%)</option>
+                ))}
+              </select>
+            )}
             <div className="flex gap-2">
               <button onClick={() => { setAssignModal(null); setSelectedVessel(''); }}
                 className="flex-1 bg-slate-700 hover:bg-slate-600 text-white py-2.5 rounded-xl transition-colors">Cancel</button>
-              <button onClick={handleAssign} disabled={!selectedVessel}
+              <button onClick={handleAssign} disabled={!selectedVessel || availableFleet.length === 0}
                 className="flex-1 bg-cyan-600 hover:bg-cyan-700 disabled:opacity-40 text-white font-semibold py-2.5 rounded-xl transition-colors">
                 Assign + Generate Brief
               </button>
@@ -689,7 +712,7 @@ export default function Dashboard() {
             <div className="bg-slate-900 rounded-xl p-4 mb-4">
               <p className="text-slate-300 text-sm leading-relaxed whitespace-pre-wrap">{handoffModal.brief}</p>
             </div>
-            <p className="text-slate-500 text-xs mb-3">This sighting is now pending acceptance by {handoffModal.toAgency}. Switch the agency selector to {handoffModal.toAgency} to accept it.</p>
+            <p className="text-slate-500 text-xs mb-3">Pending acceptance by {handoffModal.toAgency}. Use the role selector at the top (same app) to switch to that partner queue and accept.</p>
             <button onClick={() => setHandoffModal(null)} className="w-full bg-cyan-600 hover:bg-cyan-700 text-white font-semibold py-2.5 rounded-xl transition-colors">Done</button>
           </div>
         </div>

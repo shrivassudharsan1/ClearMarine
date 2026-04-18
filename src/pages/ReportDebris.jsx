@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { analyzeDebrisPhoto, analyzeDebrisText } from '../lib/gemini';
+import { analyzeDebrisPhoto, analyzeDebrisText, notesLookSufficient } from '../lib/gemini';
 import { supabase } from '../lib/supabase';
 import { predictDrift } from '../lib/drift';
 
@@ -74,17 +74,28 @@ export default function ReportDebris() {
     if (!lat || !lon) { alert('Location required.'); return; }
     setLoading(true);
     try {
-      const analysis = photo
+      let analysis = photo
         ? await analyzeDebrisPhoto(photo.base64, photo.mimeType, lat, lon)
         : await analyzeDebrisText(notes, lat, lon);
 
+      if (photo && notesLookSufficient(notes)) {
+        analysis = {
+          ...analysis,
+          needs_more_info: false,
+          confidence: analysis.confidence === 'low' ? 'medium' : analysis.confidence,
+        };
+      }
+
       if (analysis.needs_more_info === true) {
-        alert(
-          `${analysis.gemini_analysis || 'Not enough detail to score this sighting safely.'}\n\n`
-          + 'Add a clear photo and/or describe approximate size, material, and amount, then submit again.',
+        const proceed = window.confirm(
+          'The AI could not fully verify details from this report (photo or notes may be vague).\n\n'
+          + 'Are you sure you want to submit this sighting anyway?\n\n'
+          + 'OK = save to the system. Cancel = go back and add more detail.',
         );
-        setLoading(false);
-        return;
+        if (!proceed) {
+          setLoading(false);
+          return;
+        }
       }
 
       const drift = await predictDrift(lat, lon);
@@ -101,7 +112,7 @@ export default function ReportDebris() {
           estimated_volume: analysis.estimated_volume,
           gemini_analysis: notes ? `${analysis.gemini_analysis} Reporter notes: ${notes}` : analysis.gemini_analysis,
           status: 'reported',
-          jurisdiction: 'Local Coastguard',
+          jurisdiction: 'ClearMarine Operations',
           source_jurisdiction: 'public',
           handoff_status: 'none',
         })
