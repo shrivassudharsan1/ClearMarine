@@ -1,4 +1,5 @@
 import { supabase } from './supabase';
+import { getNearestGliderCurrent } from './gliderCurrents';
 
 // Cache so the same lat/lon doesn't hit Supabase twice per session
 const currentCache = new Map();
@@ -26,6 +27,34 @@ function gyroFallback(lat, lon) {
 // Snap to the nearest 5° grid point (matches seed_currents.js grid resolution)
 function snapToGrid(val, step = 5) {
   return Math.round(val / step) * step;
+}
+
+/** Resolve surface current: prefer nearby Spray/CORC glider observation, else HYCOM grid, else gyre fallback. */
+async function resolveCurrentForDrift(lat, lon) {
+  const glider = await getNearestGliderCurrent(lat, lon);
+  if (glider) {
+    return {
+      speed: glider.speed,
+      bearing: glider.bearing,
+      source: glider.source,
+    };
+  }
+
+  const hycom = await fetchCurrentFromDB(lat, lon);
+  if (hycom) {
+    return {
+      speed: hycom.speed,
+      bearing: hycom.bearing,
+      source: hycom.source,
+    };
+  }
+
+  const fb = gyroFallback(lat, lon);
+  return {
+    speed: fb.speed,
+    bearing: fb.bearing,
+    source: `${fb.source} (model; seed DB or add CORC index)`,
+  };
 }
 
 async function fetchCurrentFromDB(lat, lon) {
@@ -58,11 +87,9 @@ async function fetchCurrentFromDB(lat, lon) {
 }
 
 export async function predictDrift(lat, lon) {
-  let current = await fetchCurrentFromDB(lat, lon);
-
-  if (!current) {
-    current = gyroFallback(lat, lon);
-    console.warn('ocean_currents table empty — using gyre fallback. Run: node scripts/seed_currents.js');
+  const current = await resolveCurrentForDrift(lat, lon);
+  if (current.source.includes('fallback')) {
+    console.warn('Drift using gyre fallback — seed ocean_currents or ensure /data/corc_glider_index.json');
   }
 
   const speedKmh = current.speed * 1.852;

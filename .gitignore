@@ -22,3 +22,7 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Large raw glider NetCDF — rebuild JSON with: python3 scripts/build_corc_glider_json.py
+CORC.nc
+*.nc

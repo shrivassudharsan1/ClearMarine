@@ -222,10 +222,10 @@ export default function ReportDebris() {
               ))}
             </div>
             <p className="text-slate-500 text-xs mt-2">
-              Current: {result.drift.speed} knots at {result.drift.bearing}°
+              Current: {result.drift.speed.toFixed(2)} knots at {result.drift.bearing.toFixed(0)}°
             </p>
-            <p className="text-slate-600 text-xs mt-0.5">
-              Source: {result.drift.source}
+            <p className={`text-xs mt-1 leading-snug ${result.drift.source.includes('Spray') ? 'text-emerald-400 font-medium' : 'text-slate-500'}`}>
+              Drift driver: {result.drift.source}
             </p>
           </div>
 
