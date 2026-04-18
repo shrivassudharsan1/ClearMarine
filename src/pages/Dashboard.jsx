@@ -7,7 +7,17 @@ import { getInterceptionPoint } from '../lib/drift';
 import { computePacificLandfallDisplay, shouldShowSightingOnDashboard } from '../lib/landfall';
 import { driftSegmentsForMap } from '../lib/mapPath';
 import { formatCoordPair } from '../lib/coords';
+<<<<<<< HEAD
 import { classifyPickupMode, pickupBadgeClassName } from '../lib/pickupClassification';
+=======
+import {
+  applyDeliveredSupplyOrders,
+  insertSupplyOrder,
+  computeReorderQuantity,
+  formatEtaHuman,
+  formatCountdownTo,
+} from '../lib/supplyOrders';
+>>>>>>> f848251 (timer addition)
 
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -78,6 +88,9 @@ export default function Dashboard() {
   const [drifts, setDrifts] = useState([]);
   const [, setAssignments] = useState([]);
   const [supplies, setSupplies] = useState([]);
+  const [supplyOrders, setSupplyOrders] = useState([]);
+  const [supplySubmitId, setSupplySubmitId] = useState(null);
+  const [orderBanner, setOrderBanner] = useState(null);
   const [pendingHandoffs, setPendingHandoffs] = useState([]);
   const [aiSuggestions, setAiSuggestions] = useState([]);
   const [aiLoading, setAiLoading] = useState(false);
@@ -92,6 +105,8 @@ export default function Dashboard() {
   const [mapFlyTarget, setMapFlyTarget] = useState(null);
   const [hoverCoords, setHoverCoords] = useState(null);
   const [clickCoords, setClickCoords] = useState(null);
+  /** Drives 1s re-renders for live supply arrival countdowns (Supplies tab). */
+  const [, setSupplyCountdownTick] = useState(0);
 
   const myAgencyRef = useRef('ClearMarine Operations');
   const sightingRefs = useRef({});
@@ -99,15 +114,18 @@ export default function Dashboard() {
   const vesselsDataRef = useRef([]);
   const assignmentsDataRef = useRef([]);
   const pendingHandoffsRef = useRef([]);
+  const suppliesDataRef = useRef([]);
   const aiRefreshTimerRef = useRef(null);
 
   const fetchData = useCallback(async () => {
-    const [sRes, vRes, dRes, aRes, supRes] = await Promise.all([
+    await applyDeliveredSupplyOrders(supabase);
+    const [sRes, vRes, dRes, aRes, supRes, ordRes] = await Promise.all([
       supabase.from('debris_sightings').select('*').neq('status', 'cleared').order('density_score', { ascending: false }),
       supabase.from('vessels').select('*').order('zone'),
       supabase.from('drift_predictions').select('*'),
       supabase.from('assignments').select('*').neq('status', 'completed'),
       supabase.from('supplies').select('*').order('zone'),
+      supabase.from('supply_orders').select('*').eq('status', 'in_transit').order('expected_arrival_at'),
     ]);
     if (sRes.data) {
       const active = sRes.data.filter((s) => s.handoff_status !== 'pending');
@@ -124,15 +142,45 @@ export default function Dashboard() {
     if (vRes.data) { setVessels(vRes.data); vesselsDataRef.current = vRes.data; }
     if (dRes.data) setDrifts(dRes.data);
     if (aRes.data) { setAssignments(aRes.data); assignmentsDataRef.current = aRes.data; }
-    if (supRes.data) setSupplies(supRes.data);
+    if (supRes.data) {
+      setSupplies(supRes.data);
+      suppliesDataRef.current = supRes.data;
+    }
+    if (ordRes.error) {
+      console.warn('supply_orders:', ordRes.error.message);
+      setSupplyOrders([]);
+    } else if (ordRes.data) setSupplyOrders(ordRes.data);
   }, []);
 
+  const handlePlaceSupplyOrder = async (supply) => {
+    setSupplySubmitId(supply.id);
+    try {
+      const { error, plan } = await insertSupplyOrder(supabase, supply);
+      if (error) throw error;
+      setOrderBanner({
+        message: `Supplier order: +${plan.quantity} × ${supply.name} (${supply.zone})`,
+        detail: `${plan.supplier_name} · ETA ${formatEtaHuman(plan.expected_arrival_at)} · ${plan.fulfillment_note}`,
+      });
+      await fetchData();
+    } catch (e) {
+      console.error(e);
+      alert(
+        `Could not place order (${e.message || 'unknown'}). `
+        + 'If this is a fresh database, run the latest supabase_schema.sql (supply_orders table).',
+      );
+    } finally {
+      setSupplySubmitId(null);
+    }
+  };
+
   const fireAiSuggestions = useCallback(async () => {
+    const hasLowSupplies = (suppliesDataRef.current || []).some((s) => s.quantity <= s.low_threshold);
     if (
       sightingsDataRef.current.length === 0
       && vesselsDataRef.current.length === 0
       && assignmentsDataRef.current.length === 0
       && pendingHandoffsRef.current.length === 0
+      && !hasLowSupplies
     ) return;
     setAiLoading(true);
     try {
@@ -141,6 +189,7 @@ export default function Dashboard() {
         vessels: vesselsDataRef.current,
         assignments: assignmentsDataRef.current,
         pendingHandoffs: pendingHandoffsRef.current,
+        supplies: suppliesDataRef.current,
       });
       setAiSuggestions(Array.isArray(result) ? result : [{ text: result, action_type: 'none' }]);
     } catch (e) { console.error(e); }
@@ -177,6 +226,18 @@ export default function Dashboard() {
   }, [visibleSightings, selectedSightingId]);
 
   useEffect(() => {
+    if (!orderBanner) return undefined;
+    const t = setTimeout(() => setOrderBanner(null), 12000);
+    return () => clearTimeout(t);
+  }, [orderBanner]);
+
+  useEffect(() => {
+    if (activeTab !== 'supplies' || supplyOrders.length === 0) return undefined;
+    const id = setInterval(() => setSupplyCountdownTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [activeTab, supplyOrders.length]);
+
+  useEffect(() => {
     myAgencyRef.current = myAgency;
     void fetchData().then(() => scheduleAiRefresh());
   }, [myAgency, fetchData, scheduleAiRefresh]);
@@ -194,6 +255,9 @@ export default function Dashboard() {
         void fetchData().then(() => scheduleAiRefresh());
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'supplies' }, () => {
+        void fetchData().then(() => scheduleAiRefresh());
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'supply_orders' }, () => {
         void fetchData().then(() => scheduleAiRefresh());
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'drift_predictions' }, () => {
@@ -296,7 +360,11 @@ export default function Dashboard() {
         if (h) await acceptHandoff(h);
       } else if (s.action_type === 'reorder_supply') {
         const sup = s.supply_id ? supplies.find((x) => x.id === s.supply_id) : supplies.find((x) => x.quantity <= x.low_threshold);
-        if (sup) { await supabase.from('supplies').update({ quantity: sup.quantity + 10 }).eq('id', sup.id); await fetchData(); }
+        if (sup) {
+          const { error } = await insertSupplyOrder(supabase, sup);
+          if (error) console.error(error);
+          await fetchData();
+        }
       } else if (s.action_type === 'mark_cleared') {
         const sighting = s.sighting_id ? sightings.find((x) => x.id === s.sighting_id) : sightings.find((x) => x.status === 'intercepted');
         if (sighting) await markCleared(sighting.id);
@@ -330,7 +398,7 @@ export default function Dashboard() {
   const actionLabel = (type) => {
     if (type === 'assign_vessel') return 'Assign';
     if (type === 'accept_handoff') return 'Accept';
-    if (type === 'reorder_supply') return 'Reorder +10';
+    if (type === 'reorder_supply') return 'Order from supplier';
     if (type === 'mark_cleared') return 'Clear';
     return null;
   };
@@ -709,23 +777,104 @@ export default function Dashboard() {
 
             {activeTab === 'supplies' && (() => {
               const zones = [...new Set(supplies.map((s) => s.zone))];
-              return zones.map((zone) => (
-                <div key={zone} className="mb-3">
-                  <p className="text-slate-400 text-xs font-semibold mb-1.5">{zone}</p>
-                  {supplies.filter((s) => s.zone === zone).map((s) => {
-                    const isLow = s.quantity <= s.low_threshold;
-                    return (
-                      <div key={s.id} className={`flex items-center justify-between rounded-lg px-3 py-2 mb-1 ${isLow ? 'bg-red-950 border border-red-700' : 'bg-slate-700'}`}>
-                        <div>
-                          <span className="text-slate-200 text-xs">{s.name}</span>
-                          {isLow && <span className="ml-2 text-xs text-red-400 font-bold">PRIORITY</span>}
-                        </div>
-                        <span className={`text-sm font-bold ${isLow ? 'text-red-400' : 'text-slate-300'}`}>{s.quantity}</span>
-                      </div>
-                    );
-                  })}
+              const ordersBySupply = supplyOrders.reduce((acc, o) => {
+                if (!acc[o.supply_id]) acc[o.supply_id] = [];
+                acc[o.supply_id].push(o);
+                return acc;
+              }, {});
+              return (
+                <div className="space-y-3">
+                  {orderBanner && (
+                    <div className="bg-emerald-900/50 border border-emerald-600 rounded-xl p-3 text-xs">
+                      <p className="text-emerald-100 font-semibold">{orderBanner.message}</p>
+                      <p className="text-emerald-200/90 mt-1 leading-snug">{orderBanner.detail}</p>
+                      <button type="button" onClick={() => setOrderBanner(null)} className="text-emerald-300 hover:text-white mt-2 underline">
+                        Dismiss
+                      </button>
+                    </div>
+                  )}
+                  <p className="text-slate-500 text-xs leading-snug">
+                    Orders go to external suppliers; on-hand counts rise only after each line&apos;s ETA (checked whenever this dashboard loads or realtime fires). For demos, set REACT_APP_SUPPLY_LEAD_SCALE to a small fraction (e.g. 0.05) in .env to shorten simulated lead times.
+                  </p>
+                  {supplyOrders.length > 0 && (
+                    <div className="rounded-xl border border-slate-600 bg-slate-800/80 p-3">
+                      <p className="text-slate-400 text-xs font-semibold uppercase tracking-wide mb-2">Inbound purchase orders ({supplyOrders.length})</p>
+                      <ul className="space-y-2 max-h-44 overflow-y-auto pr-1">
+                        {supplyOrders.map((o) => {
+                          const sn = supplies.find((x) => x.id === o.supply_id);
+                          return (
+                            <li key={o.id} className="text-xs text-slate-300 border-b border-slate-700/80 pb-2 last:border-0 last:pb-0">
+                              <span className="font-semibold text-white">+{o.quantity}</span>
+                              {' '}{sn?.name || 'Item'}
+                              {sn?.zone ? <span className="text-slate-500"> · {sn.zone}</span> : null}
+                              <span className="block font-mono tabular-nums text-cyan-300 mt-1">
+                                Arrives in {formatCountdownTo(o.expected_arrival_at)}
+                              </span>
+                              <span className="block text-slate-500 text-[10px] mt-0.5">
+                                ~ {formatEtaHuman(o.expected_arrival_at)}
+                              </span>
+                              <span className="block text-slate-500 mt-0.5">{o.supplier_name}</span>
+                              {o.fulfillment_note && (
+                                <span className="block text-slate-500 mt-1 leading-snug">{o.fulfillment_note}</span>
+                              )}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </div>
+                  )}
+                  {zones.map((zone) => (
+                    <div key={zone} className="mb-3">
+                      <p className="text-slate-400 text-xs font-semibold mb-1.5">{zone}</p>
+                      {supplies.filter((s) => s.zone === zone).map((s) => {
+                        const isLow = s.quantity <= s.low_threshold;
+                        const pending = ordersBySupply[s.id] || [];
+                        const nextQty = computeReorderQuantity(s);
+                        return (
+                          <div key={s.id} className={`rounded-lg px-3 py-2 mb-2 ${isLow ? 'bg-red-950 border border-red-700' : 'bg-slate-700'}`}>
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0">
+                                <span className="text-slate-200 text-xs font-medium">{s.name}</span>
+                                {isLow && <span className="ml-2 text-xs text-red-400 font-bold">LOW</span>}
+                                <p className="text-slate-500 text-[10px] mt-0.5">Reorder batch target ≈ {nextQty} units (covers threshold + headroom)</p>
+                              </div>
+                              <div className="flex flex-col items-end gap-1 shrink-0">
+                                <span className={`text-sm font-bold tabular-nums ${isLow ? 'text-red-400' : 'text-slate-300'}`}>{s.quantity}</span>
+                                <button
+                                  type="button"
+                                  disabled={supplySubmitId === s.id}
+                                  onClick={() => handlePlaceSupplyOrder(s)}
+                                  className="bg-amber-700 hover:bg-amber-600 disabled:opacity-50 text-white text-[10px] font-semibold px-2 py-1 rounded-lg whitespace-nowrap"
+                                  title="Creates a supplier PO; inventory updates when ETA passes"
+                                >
+                                  {supplySubmitId === s.id ? '…' : `Request ~${nextQty}`}
+                                </button>
+                              </div>
+                            </div>
+                            {pending.length > 0 && (
+                              <ul className="mt-2 pt-2 border-t border-slate-600/80 space-y-1">
+                                {pending.map((o) => (
+                                  <li key={o.id} className="text-[10px] text-amber-200/90 leading-snug space-y-0.5">
+                                    <span className="block font-mono tabular-nums text-amber-300">
+                                      Arrives in {formatCountdownTo(o.expected_arrival_at)}
+                                    </span>
+                                    <span className="block text-amber-200/80">
+                                      PO in transit: +{o.quantity}
+                                      {o.stock_profile ? ` · ${o.stock_profile.replace(/_/g, ' ')}` : ''}
+                                      {' · '}
+                                      ~ {formatEtaHuman(o.expected_arrival_at)}
+                                    </span>
+                                  </li>
+                                ))}
+                              </ul>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ))}
                 </div>
-              ));
+              );
             })()}
           </div>
         </div>

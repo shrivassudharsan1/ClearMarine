@@ -222,10 +222,14 @@ ${DEBRIS_JSON_SCHEMA}`;
 }
 
 // Crew assignment + interception suggestions
-export async function getCrewSuggestions({ sightings, vessels, assignments, pendingHandoffs = [] }) {
+export async function getCrewSuggestions({ sightings, vessels, assignments, pendingHandoffs = [], supplies = [] }) {
   const available = (vessels || []).filter((v) => v.status === 'available');
   const availJson = JSON.stringify(available.map((v) => ({
     id: v.id, name: v.name, zone: v.zone, fuel: v.fuel_level, capacity: v.capacity,
+  })));
+  const lowSupplies = (supplies || []).filter((s) => s.quantity <= s.low_threshold);
+  const lowSuppliesJson = JSON.stringify(lowSupplies.map((s) => ({
+    id: s.id, name: s.name, zone: s.zone, quantity: s.quantity, low_threshold: s.low_threshold,
   })));
 
   const prompt = `You are the AI crew coordinator for ClearMarine (one operations center; vessels below are OUR fleet).
@@ -233,11 +237,13 @@ Active debris sightings: ${JSON.stringify(sightings.map(s => ({ id: s.id, type: 
 Pending handoffs to accept (this desk): ${JSON.stringify((pendingHandoffs || []).map(s => ({ handoff_id: s.id, id: s.id, from: s.source_jurisdiction, type: s.debris_type, density: s.density_label })))}
 AVAILABLE vessels (status=available — ONLY these can be assigned; you MUST pick one by name and id): ${availJson || '[]'}
 Other vessels (deployed/maintenance — do NOT assign): ${JSON.stringify((vessels || []).filter(v => v.status !== 'available').map(v => ({ name: v.name, status: v.status })))}
-Assignments: ${JSON.stringify(assignments.map(a => ({ vessel_id: a.vessel_id, sighting_id: a.sighting_id, status: a.status })))}
+Assignments: ${JSON.stringify((assignments || []).map(a => ({ vessel_id: a.vessel_id, sighting_id: a.sighting_id, status: a.status })))}
+Low stock supplies (reorder_supply — use these ids for supply_id when suggesting a purchase order): ${lowSuppliesJson || '[]'}
 
 Rules:
 - For assign_vessel: text MUST name the exact vessel (e.g. "Send Ocean Guardian I to intercept…") and set vessel_id to that vessel's UUID from AVAILABLE list only.
 - If AVAILABLE is empty: do NOT use assign_vessel. Use action_type "none" with text explaining no hulls are ready (suggest freeing a vessel or waiting). Optionally suggest reorder_supply if supplies are low.
+- reorder_supply: coordinator places an external supplier purchase order; stock is NOT immediate — ops will see an ETA. Set supply_id to a UUID from the low-stock list when possible; describe which item/zone in text.
 - Prioritize highest-density sightings and nearest zone match to the debris lat/lon.
 
 Return ONLY a JSON array of exactly 3 action items, no markdown:
