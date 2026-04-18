@@ -93,7 +93,7 @@ export async function predictDrift(lat, lon) {
   }
 
   const speedKmh = current.speed * 1.852;
-  const wobble = (Math.random() - 0.5) * 8; // ±4° directional uncertainty
+  const wobble = (Math.random() - 0.5) * 4; // ±2° — lighter noise so tracks match currents more closely
 
   const predictions = [24, 48, 72].map((h) => {
     const km = speedKmh * h;

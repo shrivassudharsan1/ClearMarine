@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useParams } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
+import { formatCoordPair } from '../lib/coords';
 
 const STATUS_OPTIONS = ['available', 'deployed', 'returning', 'maintenance'];
 
@@ -184,7 +185,9 @@ export default function VesselStation() {
             )}
             <div className="bg-slate-900 rounded-xl p-3 mb-3 text-xs space-y-1">
               <p className="text-slate-400">Intercept point</p>
-              <p className="text-cyan-400 font-mono">{assignment.interception_lat?.toFixed(4)}°N, {Math.abs(assignment.interception_lon || 0).toFixed(4)}°W</p>
+              <p className="text-cyan-400 font-mono">
+                {formatCoordPair(assignment.interception_lat ?? 0, assignment.interception_lon ?? 0)}
+              </p>
               <p className="text-slate-400">ETA: {assignment.interception_hours}h from dispatch</p>
             </div>
             {assignment.gemini_brief && (

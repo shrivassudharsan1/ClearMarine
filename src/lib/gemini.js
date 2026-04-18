@@ -5,8 +5,52 @@ const groq = new Groq({
   dangerouslyAllowBrowser: true,
 });
 
-const TEXT_MODEL = 'llama-3.3-70b-versatile';
+/** Primary text model — default 8B instant (much lower TPD than 70B). Override: REACT_APP_GROQ_TEXT_MODEL */
+const TEXT_MODEL_PRIMARY =
+  process.env.REACT_APP_GROQ_TEXT_MODEL || 'llama-3.1-8b-instant';
+
 const VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+
+/** Fallbacks must be current Groq production IDs — see https://console.groq.com/docs/deprecations */
+const TEXT_FALLBACK_8B = 'llama-3.1-8b-instant';
+const TEXT_FALLBACK_70B = 'llama-3.3-70b-versatile';
+const TEXT_FALLBACK_GPT_OSS = 'openai/gpt-oss-120b';
+
+function textModelFallbackChain() {
+  const primary = TEXT_MODEL_PRIMARY;
+  const rest =
+    primary.includes('70b') || primary.includes('gpt-oss')
+      ? [TEXT_FALLBACK_8B, TEXT_FALLBACK_GPT_OSS]
+      : [TEXT_FALLBACK_70B, TEXT_FALLBACK_8B, TEXT_FALLBACK_GPT_OSS];
+  return [primary, ...rest].filter((m, i, a) => m && a.indexOf(m) === i);
+}
+
+async function groqTextCompletion(messages) {
+  const chain = textModelFallbackChain();
+  let lastErr;
+  for (let i = 0; i < chain.length; i += 1) {
+    const model = chain[i];
+    try {
+      return await groq.chat.completions.create({
+        model,
+        messages,
+      });
+    } catch (e) {
+      lastErr = e;
+      const code = e?.code || e?.error?.code;
+      const status = e?.status;
+      const msg = String(e?.message || e?.error?.message || '');
+      const isRate = status === 429 || code === 'rate_limit_exceeded';
+      const isDeadModel =
+        status === 400 &&
+        (code === 'model_decommissioned' ||
+          /decommissioned|no longer supported/i.test(msg));
+      if ((isRate || isDeadModel) && i < chain.length - 1) continue;
+      throw e;
+    }
+  }
+  throw lastErr;
+}
 
 function extractJSON(text) {
   const start = text.indexOf('{');
@@ -101,10 +145,7 @@ A reporter at coordinates ${latitude}, ${longitude} described this debris sighti
 Use every detail they gave (object type, size words, material, count). If they gave size OR material OR amount, the description is not "empty" — set needs_more_info false unless there is truly nothing to assess.
 ${DEBRIS_JSON_SCHEMA}`;
 
-  const response = await groq.chat.completions.create({
-    model: TEXT_MODEL,
-    messages: [{ role: 'user', content: prompt }],
-  });
+  const response = await groqTextCompletion([{ role: 'user', content: prompt }]);
   let parsed = extractJSON(response.choices[0].message.content);
   parsed = applyTextNotesHeuristic(raw, parsed);
   return normalizeDebrisAnalysis(parsed);
@@ -138,10 +179,7 @@ Return ONLY a JSON array of exactly 3 action items, no markdown:
 action_type: assign_vessel | accept_handoff | reorder_supply | mark_cleared | none
 Set sighting_id, vessel_id, handoff_id from the data above when relevant.`;
 
-  const response = await groq.chat.completions.create({
-    model: TEXT_MODEL,
-    messages: [{ role: 'user', content: prompt }],
-  });
+  const response = await groqTextCompletion([{ role: 'user', content: prompt }]);
   const raw = response.choices[0].message.content.trim();
   let items;
   try {
@@ -181,10 +219,7 @@ Assessment: ${analysis}
 Brief for the receiving coordinator: debris, risk, suggested vessel class, priority.
 Max 100 words. Professional tone.`;
 
-  const response = await groq.chat.completions.create({
-    model: TEXT_MODEL,
-    messages: [{ role: 'user', content: prompt }],
-  });
+  const response = await groqTextCompletion([{ role: 'user', content: prompt }]);
   return response.choices[0].message.content;
 }
 
@@ -195,9 +230,6 @@ Intercept ${densityLabel} ${debrisType} debris in ${interceptionHours} hours at 
 Write a concise crew briefing: equipment needed, approach instructions, safety considerations.
 Max 80 words. Direct operational tone.`;
 
-  const response = await groq.chat.completions.create({
-    model: TEXT_MODEL,
-    messages: [{ role: 'user', content: prompt }],
-  });
+  const response = await groqTextCompletion([{ role: 'user', content: prompt }]);
   return response.choices[0].message.content;
 }

@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { analyzeDebrisPhoto, analyzeDebrisText, notesLookSufficient } from '../lib/gemini';
 import { supabase } from '../lib/supabase';
 import { predictDrift } from '../lib/drift';
+import { formatCoordPair, parseManualLongitude } from '../lib/coords';
 
 export default function ReportDebris() {
   const [step, setStep] = useState('name'); // name | report | done
@@ -10,6 +11,8 @@ export default function ReportDebris() {
   const [location, setLocation] = useState(null); // { lat, lon }
   const [manualLat, setManualLat] = useState('');
   const [manualLon, setManualLon] = useState('');
+  /** Unsigned manual lon uses this (default W — Pacific Americas). */
+  const [manualLonHemisphere, setManualLonHemisphere] = useState('W');
   const [locMode, setLocMode] = useState('auto'); // auto | manual
   const [loading, setLoading] = useState(false);
   const [locLoading, setLocLoading] = useState(false);
@@ -70,8 +73,13 @@ export default function ReportDebris() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     const lat = locMode === 'manual' ? parseFloat(manualLat) : location?.lat;
-    const lon = locMode === 'manual' ? parseFloat(manualLon) : location?.lon;
-    if (!lat || !lon) { alert('Location required.'); return; }
+    const lon = locMode === 'manual'
+      ? parseManualLongitude(manualLon, manualLonHemisphere === 'E' ? 'E' : 'W')
+      : location?.lon;
+    if (lat == null || lon == null || !Number.isFinite(lat) || !Number.isFinite(lon)) {
+      alert('Location required — enter valid latitude and longitude.');
+      return;
+    }
     setLoading(true);
     try {
       let analysis = photo
@@ -217,7 +225,7 @@ export default function ReportDebris() {
               {result.drift.predictions.map((p) => (
                 <div key={p.hours} className="flex items-center justify-between text-xs">
                   <span className="text-slate-400">+{p.hours}h</span>
-                  <span className="text-cyan-400 font-mono">{p.lat.toFixed(3)}°N, {Math.abs(p.lon).toFixed(3)}°W</span>
+                  <span className="text-cyan-400 font-mono">{formatCoordPair(p.lat, p.lon)}</span>
                 </div>
               ))}
             </div>
@@ -230,7 +238,17 @@ export default function ReportDebris() {
           </div>
 
           <button
-            onClick={() => { setStep('name'); setName(''); setPhoto(null); setNotes(''); setResult(null); setLocation(null); }}
+            onClick={() => {
+              setStep('name');
+              setName('');
+              setPhoto(null);
+              setNotes('');
+              setResult(null);
+              setLocation(null);
+              setManualLat('');
+              setManualLon('');
+              setManualLonHemisphere('W');
+            }}
             className="w-full bg-slate-700 hover:bg-slate-600 text-slate-200 font-medium py-3 rounded-xl transition-colors text-sm"
           >
             ← Report Another Sighting
@@ -297,29 +315,45 @@ export default function ReportDebris() {
               <p className="text-slate-400 text-sm">Detecting location...</p>
             ) : location ? (
               <p className="text-cyan-400 text-sm font-mono">
-                {location.lat.toFixed(5)}°N, {Math.abs(location.lon).toFixed(5)}°W ✓
+                {formatCoordPair(location.lat, location.lon)} ✓
               </p>
             ) : (
               <p className="text-red-400 text-sm">GPS unavailable — switch to Manual</p>
             )
           ) : (
-            <div className="flex gap-2">
-              <input
-                type="number"
-                step="any"
-                value={manualLat}
-                onChange={(e) => setManualLat(e.target.value)}
-                placeholder="Latitude (e.g. 34.05)"
-                className="flex-1 bg-slate-700 text-white placeholder-slate-500 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500"
-              />
-              <input
-                type="number"
-                step="any"
-                value={manualLon}
-                onChange={(e) => setManualLon(e.target.value)}
-                placeholder="Longitude (e.g. -120.4)"
-                className="flex-1 bg-slate-700 text-white placeholder-slate-500 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500"
-              />
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <input
+                  type="number"
+                  step="any"
+                  value={manualLat}
+                  onChange={(e) => setManualLat(e.target.value)}
+                  placeholder="Latitude (e.g. 34.05)"
+                  className="flex-1 bg-slate-700 text-white placeholder-slate-500 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                />
+                <div className="flex flex-1 gap-1 min-w-0">
+                  <input
+                    type="number"
+                    step="any"
+                    value={manualLon}
+                    onChange={(e) => setManualLon(e.target.value)}
+                    placeholder="Longitude (e.g. 120.4)"
+                    className="min-w-0 flex-1 bg-slate-700 text-white placeholder-slate-500 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                  />
+                  <select
+                    value={manualLonHemisphere}
+                    onChange={(e) => setManualLonHemisphere(e.target.value)}
+                    className="shrink-0 bg-slate-700 text-white rounded-xl px-2 py-2 text-sm border border-slate-600 focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                    title="East or West — unsigned numbers use this"
+                  >
+                    <option value="W">W</option>
+                    <option value="E">E</option>
+                  </select>
+                </div>
+              </div>
+              <p className="text-slate-500 text-xs leading-snug">
+                Tip: For US West Coast, enter longitude magnitude and choose <span className="text-slate-400">W</span> (e.g. 120.4 + W = 120.4°W). Or type a signed value <span className="font-mono text-slate-400">-120.4</span> — sign overrides the menu.
+              </p>
             </div>
           )}
         </div>

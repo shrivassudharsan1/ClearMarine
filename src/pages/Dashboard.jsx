@@ -5,6 +5,8 @@ import { supabase } from '../lib/supabase';
 import { getCrewSuggestions, generateHandoffBrief, generateAssignmentBrief } from '../lib/gemini';
 import { getInterceptionPoint } from '../lib/drift';
 import { computePacificLandfallDisplay } from '../lib/landfall';
+import { driftSegmentsForMap } from '../lib/mapPath';
+import { formatCoordPair } from '../lib/coords';
 
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -49,24 +51,6 @@ function approxOnPath(lat, lon, pathPoints, eps = 0.025) {
   return pathPoints.some(([la, lo]) => Math.abs(la - lat) < eps && Math.abs(lo - lon) < eps);
 }
 
-function driftSegmentPolylines(pathPoints) {
-  const colors = ['#eab308', '#f97316', '#ef4444'];
-  const segs = [];
-  for (let i = 0; i < pathPoints.length - 1; i += 1) {
-    segs.push({
-      positions: [pathPoints[i], pathPoints[i + 1]],
-      color: colors[Math.min(i, 2)],
-    });
-  }
-  return segs;
-}
-
-function formatCoordPair(lat, lng) {
-  if (lat == null || lng == null) return '—';
-  const ns = lat >= 0 ? `${lat.toFixed(4)}°N` : `${Math.abs(lat).toFixed(4)}°S`;
-  const ew = lng >= 0 ? `${lng.toFixed(4)}°E` : `${Math.abs(lng).toFixed(4)}°W`;
-  return `${ns}, ${ew}`;
-}
 
 function CoordTracker({ onMove, onMapClick }) {
   useMapEvents({
@@ -381,14 +365,15 @@ export default function Dashboard() {
               const drift = getDrift(s.id);
               const lf = drift
                 ? computePacificLandfallDisplay(s.latitude, s.longitude, drift)
-                : { showLandfallFlag: false, landfallPoint: null, pathPoints: [], landfallLabel: null };
-              const pathPoints = lf.pathPoints.length > 0 ? lf.pathPoints : (drift ? [
-                [s.latitude, s.longitude],
-                [drift.lat_24h, drift.lon_24h],
-                [drift.lat_48h, drift.lon_48h],
-                [drift.lat_72h, drift.lon_72h],
-              ] : []);
-              const segmentPolylines = pathPoints.length >= 2 ? driftSegmentPolylines(pathPoints) : [];
+                : {
+                  showLandfallFlag: false,
+                  landfallPoint: null,
+                  pathPoints: [],
+                  landfallLabel: null,
+                  coastAlert: null,
+                };
+              const pathPoints = lf.pathPoints.length > 0 ? lf.pathPoints : [];
+              const segmentPolylines = pathPoints.length >= 2 ? driftSegmentsForMap(pathPoints) : [];
               const isSelected = selectedSightingId === s.id;
               const landfallCoords = lf.landfallPoint ? formatCoordPair(lf.landfallPoint[0], lf.landfallPoint[1]) : null;
 
@@ -406,10 +391,15 @@ export default function Dashboard() {
                         <p className="text-gray-500">By: {s.reporter_name}</p>
                         <p className="text-gray-500">Vol: {s.estimated_volume}</p>
                         <p className="text-gray-400 font-mono text-xs">{formatCoordPair(s.latitude, s.longitude)}</p>
+                        {lf.showLandfallFlag && lf.coastAlert && (
+                          <p className="text-amber-600 font-semibold text-xs leading-snug border border-amber-700 bg-amber-50 rounded p-2">
+                            ⚑ Coast call: {lf.coastAlert}
+                          </p>
+                        )}
                         {lf.showLandfallFlag && lf.landfallLabel && (
-                          <p className="text-orange-500 font-semibold">
-                            ⚑ {lf.landfallLabel}
-                            {landfallCoords ? ` — ${landfallCoords}` : ''}. Track stops at shore approach (not inland).
+                          <p className="text-orange-600 text-xs">
+                            Model contact: {lf.landfallLabel}
+                            {landfallCoords ? ` (${landfallCoords})` : ''}. Track is clipped — not drawn inland.
                           </p>
                         )}
                       </div>
@@ -417,7 +407,7 @@ export default function Dashboard() {
                   </Marker>
 
                   {segmentPolylines.map((seg, si) => (
-                    <Polyline key={`${s.id}-seg-${si}`} positions={seg.positions} color={seg.color} weight={2} dashArray="6,4" opacity={0.85} />
+                    <Polyline key={`${s.id}-seg-${si}`} positions={seg.positions} color={seg.color} weight={2} dashArray="6,4" opacity={0.85} smoothFactor={1} />
                   ))}
 
                   {drift && pathPoints.length > 0 && (
@@ -435,14 +425,26 @@ export default function Dashboard() {
                   )}
 
                   {lf.showLandfallFlag && lf.landfallPoint && (
-                    <Marker position={lf.landfallPoint} icon={landfallIcon}>
-                      <Popup>
-                        <p className="text-xs font-semibold text-orange-600">⚑ Shore approach (model)</p>
-                        <p className="text-xs text-gray-600">{lf.landfallLabel}</p>
-                        <p className="text-xs text-gray-500 font-mono">{formatCoordPair(lf.landfallPoint[0], lf.landfallPoint[1])}</p>
-                        <p className="text-xs text-gray-500">Shown only when the drift track leaves open ocean toward the coast. Path is not drawn inland.</p>
-                      </Popup>
-                    </Marker>
+                    <>
+                      <Circle
+                        center={lf.landfallPoint}
+                        radius={16000}
+                        pathOptions={{
+                          color: '#ea580c',
+                          fillColor: '#f97316',
+                          fillOpacity: 0.38,
+                          weight: 3,
+                        }}
+                      />
+                      <Marker position={lf.landfallPoint} icon={landfallIcon}>
+                        <Popup>
+                          <p className="text-xs font-semibold text-orange-600">⚑ Land / coast contact (model)</p>
+                          <p className="text-xs text-gray-600">{lf.landfallLabel}</p>
+                          <p className="text-xs text-gray-700 font-mono font-bold">{formatCoordPair(lf.landfallPoint[0], lf.landfallPoint[1])}</p>
+                          <p className="text-xs text-amber-800 font-medium">{lf.coastAlert}</p>
+                        </Popup>
+                      </Marker>
+                    </>
                   )}
                 </div>
               );
@@ -581,9 +583,14 @@ export default function Dashboard() {
                       </div>
                       <p className="text-slate-400 text-xs mt-1">{s.estimated_volume} · {s.reporter_name}</p>
                       <p className="text-slate-500 text-xs font-mono">{formatCoordPair(s.latitude, s.longitude)}</p>
+                      {lfSide?.showLandfallFlag && lfSide.coastAlert && (
+                        <p className="text-amber-300 text-xs mt-1 leading-snug border border-amber-600/50 rounded-lg p-2 bg-amber-950/40">
+                          <span className="font-bold">Coast call:</span> {lfSide.coastAlert}
+                        </p>
+                      )}
                       {lfSide?.showLandfallFlag && lfSide.landfallPoint && (
                         <p className="text-orange-400 text-xs mt-0.5">
-                          ⚑ Shore approach: {lfSide.landfallLabel} ({formatCoordPair(lfSide.landfallPoint[0], lfSide.landfallPoint[1])}). Track clipped at coast in map view.
+                          ⚑ {lfSide.landfallLabel} — line stops at shore (not inland).
                         </p>
                       )}
                       <div className="flex gap-1 mt-1.5 flex-wrap">
@@ -694,7 +701,10 @@ export default function Dashboard() {
         <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center p-4 z-50">
           <div className="bg-slate-800 rounded-2xl p-6 max-w-md w-full border border-slate-600 shadow-2xl">
             <h3 className="text-white font-bold text-lg mb-1">Crew Brief — {briefModal.vessel}</h3>
-            <p className="text-slate-400 text-sm mb-3">Intercept in {briefModal.intercept.hours}h at {briefModal.intercept.lat.toFixed(3)}°N</p>
+            <p className="text-slate-400 text-sm mb-3">
+              Intercept in {briefModal.intercept.hours}h at{' '}
+              <span className="font-mono text-cyan-300">{formatCoordPair(briefModal.intercept.lat, briefModal.intercept.lon)}</span>
+            </p>
             <div className="bg-slate-900 rounded-xl p-4 mb-4">
               <p className="text-slate-300 text-sm leading-relaxed whitespace-pre-wrap">{briefModal.brief}</p>
             </div>

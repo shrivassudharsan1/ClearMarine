@@ -1,38 +1,188 @@
 /**
- * Crude Pacific coast model: west (more negative lon) = offshore, east = inland.
- * Used only to decide if the drift polyline crosses toward shore — not survey-grade.
+ * Pacific shoreline proxy for California / Baja: piecewise coast longitude by latitude
+ * (outer ocean boundary). Paths clip when they cross east of that line, except inside
+ * rough SF / Monterey bay water boxes so bay routing isn’t instantly “land”.
+ *
+ * IMPORTANT: This model only applies to the eastern Pacific (Americas side). If we ran
+ * it for Asia (e.g. China ~120°E), every point would look “east of the CA coast” and we’d
+ * snap a fake “landfall” to ~−121° at the same latitude — a line to California and a
+ * swapped flag. So we gate clipping on `isNortheastPacificShorelineModel`.
  */
 
-function pacificCoastLon(lat) {
-  if (lat >= 32 && lat <= 50) {
-    return -117 - ((lat - 32) / 18) * 7.5;
-  }
-  if (lat >= 22 && lat < 32) {
-    return -110 - ((lat - 22) / 10) * 7;
-  }
-  return null;
+/**
+ * CA/OR/WA heuristic coast — only valid where lon is west of ~65°W (eastern Pacific).
+ * Reports in Asia, Europe, Indian Ocean, Australia: no clip, no fake US landfall flag.
+ */
+export function isNortheastPacificShorelineModel(lat, lon) {
+  if (lat == null || lon == null || !Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+  if (lat < 8 || lat > 55) return false;
+  return lon <= -65;
 }
 
-function isOffshorePacific(lat, lon) {
-  const cl = pacificCoastLon(lat);
-  if (cl == null) return false;
-  return lon < cl - 0.04;
+/** [lat°N, coastLon°E] — open Pacific edge (more negative = farther west). */
+const COAST_KNOTS = [
+  [32.0, -117.25],
+  [32.5, -117.5],
+  [33.0, -117.9],
+  [33.5, -118.45],
+  [34.0, -119.2],
+  [34.4, -119.55],
+  [35.0, -120.95],
+  [36.0, -121.8],
+  [36.8, -122.35],
+  [37.5, -122.75],
+  [38.2, -123.15],
+  [39.0, -123.85],
+  [40.0, -124.2],
+  [41.0, -124.5],
+  [42.0, -124.7],
+  [44.0, -124.85],
+  [48.0, -125.0],
+];
+
+function outerPacificCoastLon(lat) {
+  if (lat < COAST_KNOTS[0][0] || lat > COAST_KNOTS[COAST_KNOTS.length - 1][0]) {
+    if (lat >= 22 && lat < COAST_KNOTS[0][0]) {
+      return -110.4 - (lat - 22) * (COAST_KNOTS[0][1] + 110.4) / (COAST_KNOTS[0][0] - 22);
+    }
+    return null;
+  }
+  for (let i = 0; i < COAST_KNOTS.length - 1; i += 1) {
+    const [la, lo] = COAST_KNOTS[i];
+    const [lb, lom] = COAST_KNOTS[i + 1];
+    if (lat >= la && lat <= lb) {
+      const t = (lat - la) / (lb - la);
+      return lo + t * (lom - lo);
+    }
+  }
+  return COAST_KNOTS[COAST_KNOTS.length - 1][1];
 }
 
-/** Interpolate first point along A→B that is no longer clearly offshore (shore approach / land). */
-function interpolateShoreCrossing(lat0, lon0, lat1, lon1) {
+/** Central Valley / Sierra foothills — clearly inland; catches Tracy, Modesto, etc. */
+function isCentralCaliforniaInland(lat, lon) {
+  if (lat < 35.0 || lat > 41.2) return false;
+  if (lon > -117.5) return true;
+  return lat >= 35.8 && lat <= 40.8 && lon > -120.15 && lon < -118.0;
+}
+
+function isRoughlySFBayWater(lat, lon) {
+  return lat >= 37.42 && lat <= 38.18 && lon >= -122.58 && lon <= -122.02;
+}
+
+function isRoughlyMontereyBayWater(lat, lon) {
+  return lat >= 36.45 && lat <= 36.95 && lon >= -122.12 && lon <= -121.68;
+}
+
+/**
+ * True if we treat the point as open water for drawing drift (west of shoreline,
+ * or inside coarse bay boxes — not Central Valley inland).
+ */
+export function isSeawardOfCoast(lat, lon) {
+  if (isCentralCaliforniaInland(lat, lon)) return false;
+  if (isRoughlySFBayWater(lat, lon)) return true;
+  if (isRoughlyMontereyBayWater(lat, lon)) return true;
+
+  const cl = outerPacificCoastLon(lat);
+  if (cl == null) return true;
+  return lon < cl - 0.03;
+}
+
+/**
+ * Move landfall marker onto the model shoreline at this latitude (cleaner map than raw bisection point).
+ */
+function snapLandfallToShoreline([lat, lon]) {
+  const cl = outerPacificCoastLon(lat);
+  if (cl == null) return [lat, lon];
+  return [lat, cl];
+}
+
+/** First point along segment A→B (A,B = [lat,lon]) that is no longer seaward. */
+function firstShoreContactOnSegment(a, b) {
+  const [aLat, aLon] = a;
+  const [bLat, bLon] = b;
+
+  const aOk = isSeawardOfCoast(aLat, aLon);
+  const bOk = isSeawardOfCoast(bLat, bLon);
+
+  if (!aOk) {
+    return a;
+  }
+
+  if (bOk) {
+    let lo = 0;
+    let hi = 1;
+    let anyInshore = false;
+    for (let i = 0; i < 20; i += 1) {
+      const mid = (lo + hi) / 2;
+      const lat = aLat + mid * (bLat - aLat);
+      const lon = aLon + mid * (bLon - aLon);
+      if (!isSeawardOfCoast(lat, lon)) {
+        hi = mid;
+        anyInshore = true;
+      } else {
+        lo = mid;
+      }
+    }
+    if (anyInshore && hi < 0.999) {
+      const t = hi;
+      return [aLat + t * (bLat - aLat), aLon + t * (bLon - aLon)];
+    }
+    return null;
+  }
+
   let lo = 0;
   let hi = 1;
-  for (let i = 0; i < 12; i += 1) {
+  for (let i = 0; i < 20; i += 1) {
     const mid = (lo + hi) / 2;
-    const lat = lat0 + mid * (lat1 - lat0);
-    const lon = lon0 + mid * (lon1 - lon0);
-    if (!isOffshorePacific(lat, lon)) hi = mid;
+    const lat = aLat + mid * (bLat - aLat);
+    const lon = aLon + mid * (bLon - aLon);
+    if (!isSeawardOfCoast(lat, lon)) hi = mid;
     else lo = mid;
   }
   const t = hi;
-  return [lat0 + t * (lat1 - lat0), lon0 + t * (lon1 - lon0)];
+  return [aLat + t * (bLat - aLat), aLon + t * (bLon - aLon)];
 }
+
+/**
+ * Walk origin → 24h → 48h → 72h; stop at first land / inland contact.
+ */
+export function clipDriftPathToShore(pts) {
+  if (!pts || pts.length < 2) {
+    return { pathPoints: pts || [], landfallPoint: null, hitShore: false };
+  }
+
+  const out = [pts[0]];
+  for (let i = 0; i < pts.length - 1; i += 1) {
+    const a = out[out.length - 1];
+    const b = pts[i + 1];
+    const contact = firstShoreContactOnSegment(a, b);
+
+    if (contact) {
+      const snapped = snapLandfallToShoreline(contact);
+      const same =
+        Math.abs(snapped[0] - a[0]) < 1e-6 && Math.abs(snapped[1] - a[1]) < 1e-6;
+      if (!same) {
+        out.push(snapped);
+      }
+      return {
+        pathPoints: out,
+        landfallPoint: snapped,
+        hitShore: true,
+      };
+    }
+
+    out.push(b);
+  }
+
+  return {
+    pathPoints: out,
+    landfallPoint: null,
+    hitShore: false,
+  };
+}
+
+export const COAST_ALERT_MESSAGE =
+  'Coastal alert: track reaches land in this model — notify local coast/beach authority; coordinates flagged on map.';
 
 /**
  * @returns {{
@@ -40,11 +190,18 @@ function interpolateShoreCrossing(lat0, lon0, lat1, lon1) {
  *   landfallPoint: [number, number] | null,
  *   pathPoints: [number, number][],
  *   landfallLabel: string | null,
+ *   coastAlert: string | null,
  * }}
  */
 export function computePacificLandfallDisplay(originLat, originLon, drift) {
   if (!drift) {
-    return { showLandfallFlag: false, landfallPoint: null, pathPoints: [], landfallLabel: null };
+    return {
+      showLandfallFlag: false,
+      landfallPoint: null,
+      pathPoints: [],
+      landfallLabel: null,
+      coastAlert: null,
+    };
   }
 
   const pts = [
@@ -54,37 +211,25 @@ export function computePacificLandfallDisplay(originLat, originLon, drift) {
     [drift.lat_72h, drift.lon_72h],
   ];
 
-  const startOffshore = isOffshorePacific(originLat, originLon);
-  if (!startOffshore) {
+  if (!isNortheastPacificShorelineModel(originLat, originLon)) {
     return {
       showLandfallFlag: false,
       landfallPoint: null,
       pathPoints: pts,
       landfallLabel: null,
+      coastAlert: null,
     };
   }
 
-  for (let i = 0; i < pts.length - 1; i += 1) {
-    const [aLat, aLon] = pts[i];
-    const [bLat, bLon] = pts[i + 1];
-    const aOff = i === 0 ? startOffshore : isOffshorePacific(aLat, aLon);
-    const bReachedCoast = !isOffshorePacific(bLat, bLon);
-    if (aOff && bReachedCoast) {
-      const lf = interpolateShoreCrossing(aLat, aLon, bLat, bLon);
-      const outPath = [...pts.slice(0, i + 1), lf];
-      return {
-        showLandfallFlag: true,
-        landfallPoint: lf,
-        pathPoints: outPath,
-        landfallLabel: `Shore approach ~${lf[0].toFixed(2)}°N (model)`,
-      };
-    }
-  }
+  const { pathPoints, landfallPoint, hitShore } = clipDriftPathToShore(pts);
 
   return {
-    showLandfallFlag: false,
-    landfallPoint: null,
-    pathPoints: pts,
-    landfallLabel: null,
+    showLandfallFlag: hitShore,
+    landfallPoint,
+    pathPoints,
+    landfallLabel: hitShore && landfallPoint
+      ? `Land contact ~${landfallPoint[0].toFixed(3)}°, ${landfallPoint[1].toFixed(3)}°`
+      : null,
+    coastAlert: hitShore ? COAST_ALERT_MESSAGE : null,
   };
 }
