@@ -7,7 +7,44 @@
  * it for Asia (e.g. China ~120°E), every point would look “east of the CA coast” and we’d
  * snap a fake “landfall” to ~−121° at the same latitude — a line to California and a
  * swapped flag. So we gate clipping on `isNortheastPacificShorelineModel`.
+ *
+ * Anywhere outside that model we fall back to the coarse global land mask so drift
+ * forecasts in the Atlantic, Gulf, Indian Ocean, etc. still get clipped at the coast
+ * instead of drawing across continents.
  */
+
+import { isOnGlobalLand, firstLandContactFraction } from './globalLandMask';
+
+/**
+ * Realistic 24h surface-current displacement cap (km). The Gulf Stream peaks at ~4 kn,
+ * which is ~7.4 km/h ≈ 178 km/24h. Anything larger than this in a stored drift_predictions
+ * row is almost certainly bad/stale grid data. We rescale the offending leg back along its
+ * original bearing so the path direction is preserved but the magnitude is sane.
+ */
+const MAX_KMH_FOR_DRIFT = 4 * 1.852; // ≈ 7.41 km/h
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const toR = (d) => (d * Math.PI) / 180;
+  const dLat = toR(lat2 - lat1);
+  const dLon = toR(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(toR(lat1)) * Math.cos(toR(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+/**
+ * Clamp a forecast leg so it doesn't exceed MAX_KMH_FOR_DRIFT × elapsedHours from the
+ * origin. Returns the clamped [lat, lon] (interpolated along the original direction).
+ */
+function capLegFromOrigin(originLat, originLon, lat, lon, elapsedHours) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return [lat, lon];
+  const km = haversineKm(originLat, originLon, lat, lon);
+  const maxKm = MAX_KMH_FOR_DRIFT * Math.max(1, elapsedHours);
+  if (km <= maxKm) return [lat, lon];
+  const t = maxKm / km;
+  return [originLat + t * (lat - originLat), originLon + t * (lon - originLon)];
+}
 
 /**
  * CA/OR/WA heuristic coast — only valid where lon is west of ~65°W (eastern Pacific).
@@ -121,23 +158,30 @@ export function isSeawardOfCoast(lat, lon) {
 }
 
 /**
- * True if the point is inland / onshore in the NE Pacific shoreline heuristic (not open water).
- * Outside that model (e.g. Asia, Atlantic), returns false — we do not block those reports here.
+ * On-land detection is DISABLED for now — the simple shoreline heuristic produced too many
+ * false positives (false "this is on land" calls in nearshore water and bay areas). We keep
+ * the coast geometry around for drift-path clipping and the drift→shore landfall flag
+ * (`computePacificLandfallDisplay`), but no caller treats a raw point as inland here.
+ *
+ * Re-enable by restoring the body to:
+ *   if (!isNortheastPacificShorelineModel(lat, lon)) return false;
+ *   return !isSeawardOfCoast(lat, lon);
  */
-export function isOnLandInPacificModel(lat, lon) {
-  if (!isNortheastPacificShorelineModel(lat, lon)) return false;
-  return !isSeawardOfCoast(lat, lon);
+// eslint-disable-next-line no-unused-vars
+export function isOnLandInPacificModel(_lat, _lon) {
+  return false;
 }
 
 /**
- * Map / ops queue: show only water positions in the NE Pacific coastal model.
- * On-land or invalid coordinates are omitted from the dashboard map and list.
+ * Map / ops queue: shows everything with valid coordinates. The on-land filter is disabled
+ * (see `isOnLandInPacificModel`) so that a sighting at the user's reported position is never
+ * dropped from the dashboard for being "inland" by the heuristic.
  */
 export function shouldShowSightingOnDashboard(lat, lon) {
   if (lat == null || lon == null || !Number.isFinite(Number(lat)) || !Number.isFinite(Number(lon))) {
     return false;
   }
-  return !isOnLandInPacificModel(Number(lat), Number(lon));
+  return true;
 }
 
 /**
@@ -238,6 +282,40 @@ export const COAST_ALERT_MESSAGE =
   'Coastal alert: track reaches land in this model — notify local coast/beach authority; coordinates flagged on map.';
 
 /**
+ * Walk a drift path and stop at the first leg that crosses into the coarse global land
+ * mask. Used outside the precise NE Pacific shoreline model so that a forecast in (e.g.)
+ * the Atlantic gets clipped at the first continental coast it reaches instead of drawing
+ * across the country to the "other coast".
+ */
+export function clipDriftPathAgainstGlobalLand(pts) {
+  if (!pts || pts.length < 2) {
+    return { pathPoints: pts || [], landfallPoint: null, hitShore: false };
+  }
+  if (isOnGlobalLand(pts[0][0], pts[0][1])) {
+    return { pathPoints: [pts[0]], landfallPoint: null, hitShore: false };
+  }
+
+  const out = [pts[0]];
+  for (let i = 0; i < pts.length - 1; i += 1) {
+    const a = out[out.length - 1];
+    const b = pts[i + 1];
+    const t = firstLandContactFraction(a[0], a[1], b[0], b[1]);
+    if (t == null) {
+      out.push(b);
+      continue;
+    }
+    if (t <= 1e-4) {
+      return { pathPoints: out, landfallPoint: a, hitShore: true };
+    }
+    const contactLat = a[0] + t * (b[0] - a[0]);
+    const contactLon = a[1] + t * (b[1] - a[1]);
+    out.push([contactLat, contactLon]);
+    return { pathPoints: out, landfallPoint: [contactLat, contactLon], hitShore: true };
+  }
+  return { pathPoints: out, landfallPoint: null, hitShore: false };
+}
+
+/**
  * @returns {{
  *   showLandfallFlag: boolean,
  *   landfallPoint: [number, number] | null,
@@ -257,20 +335,31 @@ export function computePacificLandfallDisplay(originLat, originLon, drift) {
     };
   }
 
-  const pts = [
-    [originLat, originLon],
-    [drift.lat_24h, drift.lon_24h],
-    [drift.lat_48h, drift.lon_48h],
-    [drift.lat_72h, drift.lon_72h],
+  // Build the raw 4-point path, then defensively cap each forecast leg to a realistic
+  // 24h-equivalent displacement from the origin. This protects the renderer from old
+  // drift_predictions rows that were written before the speed cap landed in predictDrift.
+  const cappedLegs = [
+    capLegFromOrigin(originLat, originLon, drift.lat_24h, drift.lon_24h, 24),
+    capLegFromOrigin(originLat, originLon, drift.lat_48h, drift.lon_48h, 48),
+    capLegFromOrigin(originLat, originLon, drift.lat_72h, drift.lon_72h, 72),
   ];
 
+  const pts = [[originLat, originLon], ...cappedLegs].filter(
+    ([la, lo]) => Number.isFinite(la) && Number.isFinite(lo),
+  );
+
   if (!isNortheastPacificShorelineModel(originLat, originLon)) {
+    // Outside the precise NE Pacific shoreline model: fall back to the coarse global
+    // land mask so the path still gets clipped at the first water→continent contact.
+    const clipped = clipDriftPathAgainstGlobalLand(pts);
     return {
-      showLandfallFlag: false,
-      landfallPoint: null,
-      pathPoints: pts,
-      landfallLabel: null,
-      coastAlert: null,
+      showLandfallFlag: clipped.hitShore,
+      landfallPoint: clipped.landfallPoint,
+      pathPoints: clipped.pathPoints,
+      landfallLabel: clipped.hitShore && clipped.landfallPoint
+        ? `Coast contact ~${clipped.landfallPoint[0].toFixed(2)}°, ${clipped.landfallPoint[1].toFixed(2)}°`
+        : null,
+      coastAlert: clipped.hitShore ? COAST_ALERT_MESSAGE : null,
     };
   }
 

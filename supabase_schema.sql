@@ -1,13 +1,11 @@
 -- ============================================================
 -- ClearMarine — Ocean Waste Coordination System
--- Safe to run on empty OR existing databases (idempotent DDL).
--- Does not DROP core tables or DELETE rows — use supabase_seed_demo.sql for demo reset.
+-- Safe to run on empty OR existing databases.
+-- Fully non-destructive: no DROP, no DELETE, no TRUNCATE.
+-- Only `create table if not exists`, `alter ... if not exists`, and guarded publication adds.
+-- For a clean demo reset, run supabase_seed_demo.sql separately (it is the only file that wipes rows).
+-- Legacy ClearER tables (alerts/rooms/patients) are intentionally NOT dropped — drop them manually if needed.
 -- ============================================================
-
--- Legacy ClearER-only tables (remove if you never used ClearER)
-drop table if exists alerts cascade;
-drop table if exists rooms cascade;
-drop table if exists patients cascade;
 
 -- Debris sightings reported by public/crews
 create table if not exists debris_sightings (
@@ -98,7 +96,21 @@ create table if not exists ocean_currents (
 );
 create index if not exists idx_ocean_currents_lat_lon on ocean_currents (lat, lon);
 
--- Crew assignments linking vessel to sighting intercept
+-- Land cleanup crews (beach / shore teams) — counterpart to vessels for land pickups
+create table if not exists land_crews (
+  id uuid primary key default gen_random_uuid(),
+  name text,
+  agency text,
+  status text default 'available',          -- available / deployed / returning / off_shift
+  base_lat float,
+  base_lon float,
+  capacity_kg float default 100,            -- kg one trip can carry
+  transport_speed_kmh float default 40,     -- ground transport cruise speed
+  response_minutes int default 15,          -- one-time mobilization before first transit
+  updated_at timestamp default now()
+);
+
+-- Crew assignments linking vessel OR land crew to sighting intercept / cleanup
 create table if not exists assignments (
   id uuid primary key default gen_random_uuid(),
   sighting_id uuid references debris_sightings(id) on delete cascade,
@@ -113,14 +125,42 @@ create table if not exists assignments (
 
 -- Columns added after initial deploy (safe if already present)
 alter table debris_sightings add column if not exists pickup_mode text;
-
 comment on column debris_sightings.pickup_mode is 'land | ship | ship_coast | unknown — from pickupClassification + drift';
+
+alter table vessels add column if not exists vessel_speed_kn float default 12;
+alter table vessels add column if not exists capacity_kg float default 1500;
+comment on column vessels.vessel_speed_kn is 'Cruise speed in knots — used by cleanupTime.estimateShipPickupMinutes';
+comment on column vessels.capacity_kg is 'Mass per trip in kg — overrides legacy `capacity` for trip math';
+
+alter table assignments add column if not exists crew_type text default 'ship';
+alter table assignments add column if not exists land_crew_id uuid references land_crews(id) on delete set null;
+alter table assignments add column if not exists estimated_kg float;
+alter table assignments add column if not exists estimated_trips int;
+alter table assignments add column if not exists total_minutes int;
+alter table assignments add column if not exists shore_station_lat float;
+alter table assignments add column if not exists shore_station_lon float;
+alter table assignments add column if not exists shore_station_name text;
+comment on column assignments.crew_type is 'ship | land — which fleet handled this pickup';
+comment on column assignments.shore_station_lat is 'For synthetic shore patrols (land_crew_id is null) — base latitude on the coast';
+comment on column assignments.shore_station_lon is 'For synthetic shore patrols (land_crew_id is null) — base longitude on the coast';
+comment on column assignments.shore_station_name is 'Display name for the synthetic shore patrol';
+
+-- vessel_id was previously implicitly required via FK; allow null when crew_type=land
+do $$
+begin
+  begin
+    alter table assignments alter column vessel_id drop not null;
+  exception when others then
+    null; -- already nullable, ignore
+  end;
+end $$;
 
 -- ============================================================
 -- Disable RLS for hackathon demo
 -- ============================================================
 alter table debris_sightings disable row level security;
 alter table vessels disable row level security;
+alter table land_crews disable row level security;
 alter table drift_predictions disable row level security;
 alter table supplies disable row level security;
 alter table supply_orders disable row level security;
@@ -143,63 +183,10 @@ BEGIN
     ALTER PUBLICATION supabase_realtime ADD TABLE assignments; END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname='supabase_realtime' AND tablename='drift_predictions') THEN
     ALTER PUBLICATION supabase_realtime ADD TABLE drift_predictions; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_publication_tables WHERE pubname='supabase_realtime' AND tablename='land_crews') THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE land_crews; END IF;
 END $$;
-<<<<<<< HEAD
-=======
 
--- ============================================================
--- Seed vessels
--- ============================================================
-delete from assignments;
-delete from drift_predictions;
-delete from debris_sightings;
-delete from supply_orders;
-delete from supplies;
-delete from vessels;
-
-insert into vessels (name, zone, agency, status, fuel_level, fuel_threshold, capacity, current_lat, current_lon) values
-  ('Ocean Guardian I',   'Zone A — California Coast', 'Local Coastguard', 'available',  78, 25, 100, 34.05, -120.42),
-  ('Sea Shepherd II',    'Zone B — Hawaii Waters',    'Local Coastguard', 'available',  91, 25, 120, 21.30, -157.82),
-  ('EPA Response Unit',  'Zone C — Federal Waters',   'EPA',              'available',  55, 25, 200, 36.10, -124.90),
-  ('Pacific Interceptor','Zone A — California Coast', 'Local Coastguard', 'deployed',   40, 25,  80, 33.70, -118.50),
-  ('Deep Clean Alpha',   'Zone D — Open Pacific',     'EPA',              'maintenance',20, 25, 150, 28.00, -145.00);
-
--- ============================================================
--- Seed supplies per zone
--- ============================================================
-insert into supplies (name, zone, quantity, low_threshold) values
-  ('Collection Nets',       'Zone A — California Coast', 8,  3),
-  ('Fuel Drums',            'Zone A — California Coast', 3,  4),
-  ('PPE Kits',              'Zone A — California Coast', 15, 5),
-  ('Collection Bags',       'Zone A — California Coast', 40, 10),
-  ('Collection Nets',       'Zone B — Hawaii Waters',    5,  3),
-  ('Fuel Drums',            'Zone B — Hawaii Waters',    6,  4),
-  ('Hazmat Suits',          'Zone B — Hawaii Waters',    2,  3),
-  ('Collection Nets',       'Zone C — Federal Waters',   12, 3),
-  ('Fuel Drums',            'Zone C — Federal Waters',   2,  4),
-  ('Oil Booms',             'Zone C — Federal Waters',   4,  5),
-  ('Skimmer Equipment',     'Zone D — Open Pacific',     1,  2),
-  ('Fuel Drums',            'Zone D — Open Pacific',     3,  4);
-
--- ============================================================
--- Seed sample debris sightings + drift predictions
--- ============================================================
-with s1 as (
-  insert into debris_sightings (reporter_name, latitude, longitude, debris_type, density_score, density_label, estimated_volume, gemini_analysis, status, jurisdiction)
-  values ('Coastal Patrol Officer Chen', 33.95, -119.20, 'plastic', 8, 'Critical', '~200 kg',
-    'Large accumulation of plastic bottles, bags and microplastics observed. High marine life entanglement risk. Immediate cleanup recommended.',
-    'reported', 'Local Coastguard')
-  returning id
-),
-s2 as (
-  insert into debris_sightings (reporter_name, latitude, longitude, debris_type, density_score, density_label, estimated_volume, gemini_analysis, status, jurisdiction)
-  values ('Fisherman Rodriguez', 35.40, -122.80, 'fishing_gear', 6, 'Dense', '~80 kg',
-    'Abandoned fishing nets and lines creating ghost fishing hazard. Moderate entanglement risk to marine mammals. Cleanup within 48 hours recommended.',
-    'reported', 'Local Coastguard')
-  returning id
-)
-insert into drift_predictions (sighting_id, lat_24h, lon_24h, lat_48h, lon_48h, lat_72h, lon_72h, current_speed, current_bearing)
-select s1.id, 34.12, -118.60, 34.30, -118.00, 34.50, -117.40, 1.8, 75 from s1
-union all
-select s2.id, 35.55, -122.20, 35.70, -121.60, 35.85, -121.00, 1.5, 80 from s2;
->>>>>>> f848251 (timer addition)
+-- Note: demo seed data (vessels, supplies, debris_sightings, drift_predictions, land_crews)
+-- lives in supabase_seed_demo.sql. Keeping it out of this file makes re-runs of the schema
+-- non-destructive — re-applying schema.sql never wipes rows.

@@ -8,15 +8,23 @@
 delete from assignments;
 delete from drift_predictions;
 delete from debris_sightings;
+delete from supply_orders;
 delete from supplies;
 delete from vessels;
+delete from land_crews;
 
-insert into vessels (name, zone, agency, status, fuel_level, fuel_threshold, capacity, current_lat, current_lon) values
-  ('Ocean Guardian I',   'Zone A — California Coast', 'Local Coastguard', 'available',  78, 25, 100, 34.05, -120.42),
-  ('Sea Shepherd II',    'Zone B — Hawaii Waters',    'Local Coastguard', 'available',  91, 25, 120, 21.30, -157.82),
-  ('EPA Response Unit',  'Zone C — Federal Waters',   'EPA',              'available',  55, 25, 200, 36.10, -124.90),
-  ('Pacific Interceptor','Zone A — California Coast', 'Local Coastguard', 'deployed',   40, 25,  80, 33.70, -118.50),
-  ('Deep Clean Alpha',   'Zone D — Open Pacific',     'EPA',              'maintenance',20, 25, 150, 28.00, -145.00);
+insert into vessels (name, zone, agency, status, fuel_level, fuel_threshold, capacity, capacity_kg, vessel_speed_kn, current_lat, current_lon) values
+  ('Ocean Guardian I',   'Zone A — California Coast', 'Local Coastguard', 'available',  78, 25, 100, 1500, 12, 34.05, -120.42),
+  ('Sea Shepherd II',    'Zone B — Hawaii Waters',    'Local Coastguard', 'available',  91, 25, 120, 1800, 14, 21.30, -157.82),
+  ('EPA Response Unit',  'Zone C — Federal Waters',   'EPA',              'available',  55, 25, 200, 3000, 10, 36.10, -124.90),
+  ('Pacific Interceptor','Zone A — California Coast', 'Local Coastguard', 'deployed',   40, 25,  80, 1200, 13, 33.70, -118.50),
+  ('Deep Clean Alpha',   'Zone D — Open Pacific',     'EPA',              'maintenance',20, 25, 150, 2200,  9, 28.00, -145.00);
+
+insert into land_crews (name, agency, status, base_lat, base_lon, capacity_kg, transport_speed_kmh, response_minutes) values
+  ('SD Beach Patrol',       'Local Coastguard', 'available', 32.72, -117.16, 120, 50, 12),
+  ('OC Shore Crew',         'Local Coastguard', 'available', 33.66, -117.93, 100, 45, 15),
+  ('LA Harbor Land Unit',   'Local Coastguard', 'available', 33.74, -118.27, 150, 45, 18),
+  ('Monterey Coast Team',   'EPA',              'available', 36.60, -121.89, 110, 50, 20);
 
 insert into supplies (name, zone, quantity, low_threshold) values
   ('Collection Nets',       'Zone A — California Coast', 8,  3),

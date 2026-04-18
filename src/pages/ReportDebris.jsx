@@ -7,7 +7,8 @@ import {
 } from '../lib/gemini';
 import { supabase } from '../lib/supabase';
 import { predictDrift } from '../lib/drift';
-import { isOnLandInPacificModel } from '../lib/landfall';
+// On-land detection is disabled for now — see landfall.isOnLandInPacificModel.
+// import { isOnLandInPacificModel } from '../lib/landfall';
 import { classifyPickupMode, pickupBadgeClassName } from '../lib/pickupClassification';
 import { coordsNearlyEqual, formatCoordPair, normalizeLatLon, parseManualLongitudeWest } from '../lib/coords';
 
@@ -205,10 +206,8 @@ export default function ReportDebris() {
 
       const drift = await predictDrift(coords.lat, coords.lon);
 
-      if (isOnLandInPacificModel(coords.lat, coords.lon)) {
-        setLandReview({ analysis, drift, coords, pickup: classifyPickupMode(coords.lat, coords.lon, drift) });
-        return;
-      }
+      // On-land interception disabled — submissions go straight through; the drift→shore
+      // classifier (ship_coast) still routes flagged debris to shore crews downstream.
 
       const pickup = classifyPickupMode(coords.lat, coords.lon, drift);
 
@@ -437,6 +436,12 @@ export default function ReportDebris() {
             </p>
           </div>
 
+          <a
+            href={`/dashboard?lat=${result.lat}&lon=${result.lon}`}
+            className="w-full block text-center bg-cyan-600 hover:bg-cyan-500 text-white font-semibold py-3 rounded-xl transition-colors text-sm mb-2"
+          >
+            View on Dashboard Map →
+          </a>
           <button
             onClick={() => {
               setStep('name');

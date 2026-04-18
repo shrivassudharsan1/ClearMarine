@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
 import { formatCoordPair } from '../lib/coords';
 import { labelForPickupKey, pickupBadgeClassName } from '../lib/pickupClassification';
+import { formatEtaShort } from '../lib/cleanupTime';
 
 const STATUS_OPTIONS = ['available', 'deployed', 'returning', 'maintenance'];
 
@@ -198,6 +199,25 @@ export default function VesselStation() {
               </p>
               <p className="text-slate-400">ETA: {assignment.interception_hours}h from dispatch</p>
             </div>
+            {(Number.isFinite(assignment.estimated_kg) || Number.isFinite(assignment.estimated_trips) || Number.isFinite(assignment.total_minutes)) && (
+              <div className="bg-slate-900 rounded-xl p-3 mb-3 text-xs space-y-1 border border-emerald-800">
+                <p className="text-emerald-300 font-semibold uppercase tracking-wider text-[10px]">Cleanup estimate</p>
+                <div className="flex flex-wrap gap-x-3 gap-y-1 text-slate-300">
+                  {Number.isFinite(assignment.estimated_kg) && (
+                    <span>~<span className="font-mono text-white">{Math.round(assignment.estimated_kg)} kg</span></span>
+                  )}
+                  {Number.isFinite(assignment.estimated_trips) && (
+                    <span><span className="font-mono text-white">{assignment.estimated_trips}</span> trip{assignment.estimated_trips === 1 ? '' : 's'}</span>
+                  )}
+                  {Number.isFinite(assignment.total_minutes) && (
+                    <span>total <span className="font-mono text-white">{formatEtaShort(assignment.total_minutes)}</span></span>
+                  )}
+                </div>
+                {assignment.crew_type && (
+                  <p className="text-slate-500 text-[10px]">Mode: {assignment.crew_type === 'land' ? 'shore crew' : 'ship vessel'}</p>
+                )}
+              </div>
+            )}
             {assignment.gemini_brief && (
               <div className="bg-slate-900 rounded-xl p-3 mb-3">
                 <p className="text-slate-400 text-xs mb-1 font-medium">Crew Brief</p>

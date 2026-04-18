@@ -221,39 +221,77 @@ ${DEBRIS_JSON_SCHEMA}`;
   return normalizeDebrisAnalysis(parsed, reporterStructured);
 }
 
-// Crew assignment + interception suggestions
-export async function getCrewSuggestions({ sightings, vessels, assignments, pendingHandoffs = [], supplies = [] }) {
-  const available = (vessels || []).filter((v) => v.status === 'available');
-  const availJson = JSON.stringify(available.map((v) => ({
-    id: v.id, name: v.name, zone: v.zone, fuel: v.fuel_level, capacity: v.capacity,
-  })));
+/**
+ * Crew assignment + interception suggestions.
+ * Pass `crewRankings` as a Map<sighting_id, { ranked: [{ crewType, crewId, crewName, totalMinutes, trips, kg }] }>
+ * (from src/lib/cleanupTime.rankCrewsForSighting). The model is forced to choose from the top options.
+ *
+ * `supplies` (optional) lets the coordinator emit a `reorder_supply` purchase order when stock is low.
+ */
+export async function getCrewSuggestions({
+  sightings,
+  vessels,
+  landCrews = [],
+  assignments,
+  pendingHandoffs = [],
+  crewRankings = null,
+  supplies = [],
+}) {
+  const availableShips = (vessels || []).filter((v) => v.status === 'available');
+  const availableLand = (landCrews || []).filter((c) => c.status === 'available');
   const lowSupplies = (supplies || []).filter((s) => s.quantity <= s.low_threshold);
   const lowSuppliesJson = JSON.stringify(lowSupplies.map((s) => ({
     id: s.id, name: s.name, zone: s.zone, quantity: s.quantity, low_threshold: s.low_threshold,
   })));
 
-  const prompt = `You are the AI crew coordinator for ClearMarine (one operations center; vessels below are OUR fleet).
-Active debris sightings: ${JSON.stringify(sightings.map(s => ({ id: s.id, type: s.debris_type, density: s.density_label, score: s.density_score, lat: s.latitude, lon: s.longitude, status: s.status })))}
+  // Compact precomputed ranking per sighting (top 3) so the model recommends the option with lowest total_minutes.
+  const rankingsForPrompt = (sightings || []).map((s) => {
+    const r = crewRankings && (crewRankings.get ? crewRankings.get(s.id) : crewRankings[s.id]);
+    const top = (r?.ranked || []).slice(0, 3).map((opt) => ({
+      crew_type: opt.crewType,
+      id: opt.crewId,
+      name: opt.crewName,
+      total_minutes: opt.totalMinutes,
+      trips: opt.trips,
+      kg: Math.round(opt.kg),
+    }));
+    return { sighting_id: s.id, kg: r?.kg ? Math.round(r.kg) : null, top_crew_options: top };
+  });
+
+  const noOptions = rankingsForPrompt.every((r) => r.top_crew_options.length === 0);
+
+  const prompt = `You are the AI crew coordinator for ClearMarine (one operations center; vessels and land crews below are OUR fleet).
+Active debris sightings: ${JSON.stringify(sightings.map(s => ({ id: s.id, type: s.debris_type, density: s.density_label, score: s.density_score, lat: s.latitude, lon: s.longitude, status: s.status, pickup_mode: s.pickup_mode })))}
 Pending handoffs to accept (this desk): ${JSON.stringify((pendingHandoffs || []).map(s => ({ handoff_id: s.id, id: s.id, from: s.source_jurisdiction, type: s.debris_type, density: s.density_label })))}
-AVAILABLE vessels (status=available — ONLY these can be assigned; you MUST pick one by name and id): ${availJson || '[]'}
-Other vessels (deployed/maintenance — do NOT assign): ${JSON.stringify((vessels || []).filter(v => v.status !== 'available').map(v => ({ name: v.name, status: v.status })))}
-Assignments: ${JSON.stringify((assignments || []).map(a => ({ vessel_id: a.vessel_id, sighting_id: a.sighting_id, status: a.status })))}
+AVAILABLE ship vessels: ${JSON.stringify(availableShips.map((v) => ({ id: v.id, name: v.name, zone: v.zone, fuel: v.fuel_level })))}
+AVAILABLE land crews: ${JSON.stringify(availableLand.map((c) => ({ id: c.id, name: c.name, agency: c.agency })))}
+Other crews (deployed/maintenance — do NOT assign): ${JSON.stringify([
+    ...((vessels || []).filter(v => v.status !== 'available').map(v => ({ name: v.name, status: v.status, kind: 'ship' }))),
+    ...((landCrews || []).filter(c => c.status !== 'available').map(c => ({ name: c.name, status: c.status, kind: 'land' }))),
+  ])}
+Assignments: ${JSON.stringify((assignments || []).map(a => ({ vessel_id: a.vessel_id, land_crew_id: a.land_crew_id, sighting_id: a.sighting_id, status: a.status, crew_type: a.crew_type })))}
 Low stock supplies (reorder_supply — use these ids for supply_id when suggesting a purchase order): ${lowSuppliesJson || '[]'}
 
+Pre-computed crew ETA rankings per sighting (already accounts for distance, vessel speed, capacity, trips, and on-site work):
+${JSON.stringify(rankingsForPrompt)}
+
 Rules:
-- For assign_vessel: text MUST name the exact vessel (e.g. "Send Ocean Guardian I to intercept…") and set vessel_id to that vessel's UUID from AVAILABLE list only.
-- If AVAILABLE is empty: do NOT use assign_vessel. Use action_type "none" with text explaining no hulls are ready (suggest freeing a vessel or waiting). Optionally suggest reorder_supply if supplies are low.
+- For dispatch picks, you MUST choose from the corresponding sighting's top_crew_options. Recommend the option with the LOWEST total_minutes.
+- If the chosen option has crew_type="ship", emit action_type "assign_vessel" with vessel_id = that option's id.
+- If crew_type="land", emit action_type "assign_land_crew" with land_crew_id = that option's id.
+- The text MUST name the crew, the ETA (e.g. "47 min"), the trip count, and the site kg (e.g. "Send Ocean Guardian I — 47 min, 1 trip, ~120 kg").
+- Never invent a crew that isn't in top_crew_options.
+- If a sighting has top_crew_options=[] (no available crew for that pickup mode), use action_type "none" and explain what's blocking. If supplies are low, prefer reorder_supply over a useless dispatch suggestion.
 - reorder_supply: coordinator places an external supplier purchase order; stock is NOT immediate — ops will see an ETA. Set supply_id to a UUID from the low-stock list when possible; describe which item/zone in text.
-- Prioritize highest-density sightings and nearest zone match to the debris lat/lon.
+- Prioritize highest-density sightings and shortest ETA.
 
 Return ONLY a JSON array of exactly 3 action items, no markdown:
 [
-  {"text":"Send [VESSEL NAME] to …","action_type":"assign_vessel","sighting_id":null,"vessel_id":null,"supply_id":null,"handoff_id":null},
-  {"text":"…","action_type":"accept_handoff","sighting_id":null,"vessel_id":null,"supply_id":null,"handoff_id":null},
-  {"text":"…","action_type":"reorder_supply","sighting_id":null,"vessel_id":null,"supply_id":null,"handoff_id":null}
+  {"text":"…","action_type":"assign_vessel","sighting_id":null,"vessel_id":null,"land_crew_id":null,"supply_id":null,"handoff_id":null},
+  {"text":"…","action_type":"assign_land_crew","sighting_id":null,"vessel_id":null,"land_crew_id":null,"supply_id":null,"handoff_id":null},
+  {"text":"…","action_type":"accept_handoff","sighting_id":null,"vessel_id":null,"land_crew_id":null,"supply_id":null,"handoff_id":null}
 ]
-action_type: assign_vessel | accept_handoff | reorder_supply | mark_cleared | none
-Set sighting_id, vessel_id, handoff_id from the data above when relevant.`;
+action_type: assign_vessel | assign_land_crew | accept_handoff | reorder_supply | mark_cleared | none`;
 
   const response = await groqTextCompletion([{ role: 'user', content: prompt }]);
   const raw = response.choices[0].message.content.trim();
@@ -265,25 +303,29 @@ Set sighting_id, vessel_id, handoff_id from the data above when relevant.`;
       const one = extractJSON(raw);
       items = Array.isArray(one) ? one : [one];
     } catch {
-      items = [{ text: raw.slice(0, 120), action_type: 'none', sighting_id: null, vessel_id: null, supply_id: null, handoff_id: null }];
+      items = [{ text: raw.slice(0, 120), action_type: 'none', sighting_id: null, vessel_id: null, land_crew_id: null, supply_id: null, handoff_id: null }];
     }
   }
 
   if (!Array.isArray(items)) items = [items];
-  if (available.length === 0) {
-    return items.map((row) => {
-      if (row && row.action_type === 'assign_vessel') {
-        return {
-          ...row,
-          action_type: 'none',
-          vessel_id: null,
-          text: 'No cleanup vessels are available — free a hull from deployment/maintenance or wait for a returning crew before assigning.',
-        };
+
+  // Guardrail: drop crew picks that don't match a real available option, or strip out when no options exist at all.
+  const validShipIds = new Set(availableShips.map((v) => v.id));
+  const validLandIds = new Set(availableLand.map((c) => c.id));
+  return items.map((row) => {
+    if (!row || typeof row !== 'object') return row;
+    if (row.action_type === 'assign_vessel') {
+      if (noOptions || !row.vessel_id || !validShipIds.has(row.vessel_id)) {
+        return { ...row, action_type: 'none', vessel_id: null, text: row.text || 'No matching ship available — free a hull or pick from the dispatch list.' };
       }
-      return row;
-    });
-  }
-  return items;
+    }
+    if (row.action_type === 'assign_land_crew') {
+      if (noOptions || !row.land_crew_id || !validLandIds.has(row.land_crew_id)) {
+        return { ...row, action_type: 'none', land_crew_id: null, text: row.text || 'No matching land crew available — free a team or pick from the dispatch list.' };
+      }
+    }
+    return row;
+  });
 }
 
 // Generate jurisdiction handoff brief

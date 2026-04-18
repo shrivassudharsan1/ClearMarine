@@ -10,9 +10,10 @@ const offshoreDrift = {
 };
 
 describe('classifyPickupMode', () => {
-  test('inland CA → land', () => {
+  test('on-land detection is disabled — formerly-inland points fall through to drift-based modes', () => {
     const r = classifyPickupMode(37.5, -121, offshoreDrift);
-    expect(r.key).toBe(PICKUP_MODE.LAND);
+    // No more auto LAND classification from a single point heuristic.
+    expect(r.key).not.toBe(PICKUP_MODE.LAND);
   });
 
   test('offshore Pacific, track stays sea → ship', () => {

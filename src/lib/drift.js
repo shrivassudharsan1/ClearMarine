@@ -86,6 +86,13 @@ async function fetchCurrentFromDB(lat, lon) {
   };
 }
 
+/**
+ * Realistic upper bound for sustained surface-current drift. The Gulf Stream core peaks
+ * around 4–5 kn; most basins are well under 1 kn. This cap defends against bad/stale grid
+ * data producing 20+ kn vectors that would draw a 72h forecast halfway across a continent.
+ */
+const MAX_SURFACE_DRIFT_KNOTS = 4;
+
 export async function predictDrift(lat, lon) {
   const norm = normalizeLatLon(lat, lon);
   if (!norm) {
@@ -97,7 +104,8 @@ export async function predictDrift(lat, lon) {
     console.warn('Drift using gyre fallback — seed ocean_currents or ensure /data/corc_glider_index.json');
   }
 
-  const speed = Number.isFinite(current.speed) ? Math.max(0, current.speed) : 0;
+  const rawSpeed = Number.isFinite(current.speed) ? Math.max(0, current.speed) : 0;
+  const speed = Math.min(rawSpeed, MAX_SURFACE_DRIFT_KNOTS);
   const bearing = Number.isFinite(current.bearing) ? current.bearing : 0;
 
   const speedKmh = speed * 1.852;

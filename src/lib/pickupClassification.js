@@ -9,7 +9,6 @@
 import {
   computePacificLandfallDisplay,
   isNortheastPacificShorelineModel,
-  isOnLandInPacificModel,
 } from './landfall';
 
 /** @typedef {{ key: string, shortLabel: string, detail: string }} PickupClassification */
@@ -23,9 +22,10 @@ export const PICKUP_MODE = {
 
 /** Short labels for DB-backed `pickup_mode` column */
 export const PICKUP_MODE_LABELS = {
-  [PICKUP_MODE.LAND]: 'Land pickup',
-  [PICKUP_MODE.SHIP]: 'Ship pickup',
-  [PICKUP_MODE.SHIP_AND_COAST]: 'Ship + coast',
+  [PICKUP_MODE.LAND]: 'Land crew',
+  [PICKUP_MODE.SHIP]: 'Ship crew',
+  // ship_coast = drift forecast reaches shore → handled by SHORE crew (auto-dispatched).
+  [PICKUP_MODE.SHIP_AND_COAST]: 'Shore crew (drift→land)',
   [PICKUP_MODE.UNKNOWN]: 'Verify',
 };
 
@@ -41,7 +41,8 @@ export function pickupBadgeClassName(key) {
     case PICKUP_MODE.SHIP:
       return 'bg-cyan-950 text-cyan-200 border border-cyan-600/80';
     case PICKUP_MODE.SHIP_AND_COAST:
-      return 'bg-violet-950 text-violet-200 border border-violet-600/80';
+      // Drift will hit shore — treat as a land-team job (amber, like LAND) but with a stronger ring.
+      return 'bg-amber-900/80 text-amber-100 border border-amber-500';
     default:
       return 'bg-slate-700 text-slate-300 border border-slate-600';
   }
@@ -62,14 +63,8 @@ export function classifyPickupMode(originLat, originLon, drift) {
     };
   }
 
-  if (isOnLandInPacificModel(originLat, originLon)) {
-    return {
-      key: PICKUP_MODE.LAND,
-      shortLabel: 'Land pickup',
-      detail:
-        'Position is inland or onshore in the Pacific coastal model — prioritize beach, shore, or land-based cleanup.',
-    };
-  }
+  // On-land detection is intentionally disabled — see landfall.isOnLandInPacificModel.
+  // Drift→shore detection (ship_coast / shore-crew lane) still runs below via computePacificLandfallDisplay.
 
   if (!isNortheastPacificShorelineModel(originLat, originLon)) {
     return {
@@ -97,9 +92,9 @@ export function classifyPickupMode(originLat, originLon, drift) {
   if (lf.showLandfallFlag) {
     return {
       key: PICKUP_MODE.SHIP_AND_COAST,
-      shortLabel: 'Ship + coast',
+      shortLabel: 'Shore crew',
       detail:
-        'Offshore in the model, but the 24–72h track reaches land — send a vessel if intercept is feasible; coordinate coastal/beach teams for landfall.',
+        'Drift forecast reaches land within 24–72h — this is a SHORE-crew job. ClearMarine auto-dispatches the closest available land team; ships are only used as a fallback if no shore crew is ready.',
     };
   }
 

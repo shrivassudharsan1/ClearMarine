@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { MapContainer, TileLayer, Marker, Polyline, Popup, Circle, useMapEvents, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import { supabase } from '../lib/supabase';
@@ -8,6 +9,8 @@ import { computePacificLandfallDisplay, shouldShowSightingOnDashboard } from '..
 import { driftSegmentsForMap } from '../lib/mapPath';
 import { formatCoordPair } from '../lib/coords';
 import { classifyPickupMode, pickupBadgeClassName } from '../lib/pickupClassification';
+import { rankCrewsForSighting, formatEtaShort } from '../lib/cleanupTime';
+import { synthesizeShoreStationForSighting, isSyntheticShoreId } from '../lib/shoreStations';
 import {
   applyDeliveredSupplyOrders,
   insertSupplyOrder,
@@ -23,19 +26,64 @@ L.Icon.Default.mergeOptions({
   shadowUrl: require('leaflet/dist/images/marker-shadow.png'),
 });
 
-const debrisIcon = (score, selected = false) => L.divIcon({
-  className: '',
-  html: `<div style="width:${selected ? 22 : 16}px;height:${selected ? 22 : 16}px;border-radius:50%;background:${score >= 8 ? '#dc2626' : score >= 6 ? '#ea580c' : score >= 3 ? '#ca8a04' : '#16a34a'};border:${selected ? '3px solid #22d3ee' : '2px solid white'};box-shadow:0 0 ${selected ? 10 : 4}px ${selected ? 'rgba(34,211,238,0.6)' : 'rgba(0,0,0,0.5)'}"></div>`,
-  iconSize: [selected ? 22 : 16, selected ? 22 : 16],
-  iconAnchor: [selected ? 11 : 8, selected ? 11 : 8],
-});
+if (typeof document !== 'undefined' && !document.getElementById('cm-pulse-style')) {
+  const style = document.createElement('style');
+  style.id = 'cm-pulse-style';
+  style.textContent = '@keyframes cm-pulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.18); opacity: 0.75; } }';
+  document.head.appendChild(style);
+}
 
-const vesselIcon = L.divIcon({
-  className: '',
-  html: `<div style="font-size:20px;line-height:1;filter:drop-shadow(0 1px 2px rgba(0,0,0,0.8))">🚢</div>`,
-  iconSize: [24, 24],
-  iconAnchor: [12, 12],
-});
+/** Stable palette used to color-link a sighting and the crew/vessel working it. */
+const MISSION_PALETTE = ['#22d3ee', '#a855f7', '#f59e0b', '#10b981', '#f43f5e', '#3b82f6', '#eab308', '#ec4899'];
+
+/** Hash an assignment id to a stable palette index so the same mission always gets the same color. */
+function colorForMissionId(missionId) {
+  if (!missionId) return null;
+  let hash = 0;
+  for (let i = 0; i < missionId.length; i += 1) hash = (hash * 31 + missionId.charCodeAt(i)) >>> 0;
+  return MISSION_PALETTE[hash % MISSION_PALETTE.length];
+}
+
+const debrisIcon = (score, selected = false, missionColor = null) => {
+  const fill = score >= 8 ? '#dc2626' : score >= 6 ? '#ea580c' : score >= 3 ? '#ca8a04' : '#16a34a';
+  const size = selected ? 26 : missionColor ? 22 : 16;
+  const ringWidth = missionColor ? 4 : selected ? 3 : 2;
+  const ringColor = missionColor || (selected ? '#22d3ee' : 'white');
+  const glow = missionColor
+    ? `0 0 12px ${missionColor}cc`
+    : selected
+      ? '0 0 10px rgba(34,211,238,0.6)'
+      : '0 0 4px rgba(0,0,0,0.5)';
+  return L.divIcon({
+    className: '',
+    html: `<div style="width:${size}px;height:${size}px;border-radius:50%;background:${fill};border:${ringWidth}px solid ${ringColor};box-shadow:${glow};${missionColor && selected ? 'animation:cm-pulse 1.6s ease-in-out infinite;' : ''}"></div>`,
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+  });
+};
+
+const vesselIcon = (missionColor = null, selected = false) => {
+  const size = missionColor ? (selected ? 32 : 28) : 24;
+  const halo = missionColor
+    ? `<div style="position:absolute;inset:0;border-radius:50%;border:${selected ? 3 : 2}px solid ${missionColor};background:${missionColor}33;box-shadow:0 0 ${selected ? 14 : 8}px ${missionColor}cc;${selected ? 'animation:cm-pulse 1.6s ease-in-out infinite;' : ''}"></div>`
+    : '';
+  return L.divIcon({
+    className: '',
+    html: `<div style="position:relative;width:${size}px;height:${size}px;display:flex;align-items:center;justify-content:center;">${halo}<div style="position:relative;font-size:20px;line-height:1;filter:drop-shadow(0 1px 2px rgba(0,0,0,0.8))">🚢</div></div>`,
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+  });
+};
+
+const landCrewIcon = (missionColor, selected = false) => {
+  const size = selected ? 30 : 26;
+  return L.divIcon({
+    className: '',
+    html: `<div style="position:relative;width:${size}px;height:${size}px;display:flex;align-items:center;justify-content:center;"><div style="position:absolute;inset:0;border-radius:50%;border:${selected ? 3 : 2}px solid ${missionColor};background:${missionColor}33;box-shadow:0 0 ${selected ? 14 : 8}px ${missionColor}cc;${selected ? 'animation:cm-pulse 1.6s ease-in-out infinite;' : ''}"></div><div style="position:relative;font-size:16px;line-height:1;">🥾</div></div>`,
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+  });
+};
 
 const landfallIcon = L.divIcon({
   className: '',
@@ -80,10 +128,13 @@ function MapFlyTo({ target }) {
 }
 
 export default function Dashboard() {
+  const [searchParams] = useSearchParams();
   const [sightings, setSightings] = useState([]);
   const [vessels, setVessels] = useState([]);
+  const [landCrews, setLandCrews] = useState([]);
   const [drifts, setDrifts] = useState([]);
-  const [, setAssignments] = useState([]);
+  const [assignments, setAssignments] = useState([]);
+  const [selectedMissionId, setSelectedMissionId] = useState(null);
   const [supplies, setSupplies] = useState([]);
   const [supplyOrders, setSupplyOrders] = useState([]);
   const [supplySubmitId, setSupplySubmitId] = useState(null);
@@ -95,7 +146,8 @@ export default function Dashboard() {
   const [assignModal, setAssignModal] = useState(null);
   const [handoffModal, setHandoffModal] = useState(null);
   const [briefModal, setBriefModal] = useState(null);
-  const [selectedVessel, setSelectedVessel] = useState('');
+  /** Selected crew option from the assign modal: { type: 'ship'|'land', id, est } where est is a row from cleanupTime.rankCrewsForSighting. */
+  const [selectedCrew, setSelectedCrew] = useState(null);
   const [activeTab, setActiveTab] = useState('sightings');
   const [myAgency, setMyAgency] = useState('ClearMarine Operations');
   const [selectedSightingId, setSelectedSightingId] = useState(null);
@@ -105,20 +157,31 @@ export default function Dashboard() {
   /** Drives 1s re-renders for live supply arrival countdowns (Supplies tab). */
   const [, setSupplyCountdownTick] = useState(0);
 
+  /** URL params from a just-submitted report: fly map there on load. */
+  const focusLat = parseFloat(searchParams.get('lat'));
+  const focusLon = parseFloat(searchParams.get('lon'));
+  const hasFocusTarget = Number.isFinite(focusLat) && Number.isFinite(focusLon);
+
   const myAgencyRef = useRef('ClearMarine Operations');
   const sightingRefs = useRef({});
   const sightingsDataRef = useRef([]);
   const vesselsDataRef = useRef([]);
+  const landCrewsDataRef = useRef([]);
+  const driftsDataRef = useRef([]);
   const assignmentsDataRef = useRef([]);
   const pendingHandoffsRef = useRef([]);
   const suppliesDataRef = useRef([]);
   const aiRefreshTimerRef = useRef(null);
+  /** sighting ids currently being auto-dispatched to a shore crew (avoids double-assigning). */
+  const autoDispatchInFlightRef = useRef(new Set());
 
   const fetchData = useCallback(async () => {
+    // Mark in-transit supply orders as 'delivered' once their ETA passes (idempotent).
     await applyDeliveredSupplyOrders(supabase);
-    const [sRes, vRes, dRes, aRes, supRes, ordRes] = await Promise.all([
+    const [sRes, vRes, lcRes, dRes, aRes, supRes, ordRes] = await Promise.all([
       supabase.from('debris_sightings').select('*').neq('status', 'cleared').order('density_score', { ascending: false }),
       supabase.from('vessels').select('*').order('zone'),
+      supabase.from('land_crews').select('*').order('name'),
       supabase.from('drift_predictions').select('*'),
       supabase.from('assignments').select('*').neq('status', 'completed'),
       supabase.from('supplies').select('*').order('zone'),
@@ -137,7 +200,8 @@ export default function Dashboard() {
       pendingHandoffsRef.current = incoming;
     }
     if (vRes.data) { setVessels(vRes.data); vesselsDataRef.current = vRes.data; }
-    if (dRes.data) setDrifts(dRes.data);
+    if (lcRes.data) { setLandCrews(lcRes.data); landCrewsDataRef.current = lcRes.data; }
+    if (dRes.data) { setDrifts(dRes.data); driftsDataRef.current = dRes.data; }
     if (aRes.data) { setAssignments(aRes.data); assignmentsDataRef.current = aRes.data; }
     if (supRes.data) {
       setSupplies(supRes.data);
@@ -181,11 +245,43 @@ export default function Dashboard() {
     ) return;
     setAiLoading(true);
     try {
+      // Build a fresh ranking map from refs so the AI prompt always sees current state.
+      const liveSightings = sightingsDataRef.current;
+      const liveVessels = vesselsDataRef.current;
+      const liveLandCrews = landCrewsDataRef.current;
+      const liveDrifts = driftsDataRef.current;
+      const rankingsForAi = new Map();
+      for (const s of liveSightings) {
+        const drift = liveDrifts.find((d) => d.sighting_id === s.id) || null;
+        const driftForPickup = drift ? {
+          lat_24h: drift.lat_24h, lon_24h: drift.lon_24h,
+          lat_48h: drift.lat_48h, lon_48h: drift.lon_48h,
+          lat_72h: drift.lat_72h, lon_72h: drift.lon_72h,
+        } : null;
+        const pickup = classifyPickupMode(s.latitude, s.longitude, driftForPickup);
+        const wantsShoreCrew = pickup.key === 'ship_coast' || pickup.key === 'land';
+        const syntheticStation = wantsShoreCrew
+          ? synthesizeShoreStationForSighting(s, driftForPickup)
+          : null;
+        const effectiveLandCrews = syntheticStation
+          ? [syntheticStation, ...liveLandCrews]
+          : liveLandCrews;
+        const r = rankCrewsForSighting({
+          pickupKey: pickup.key,
+          sighting: s,
+          vessels: liveVessels,
+          landCrews: effectiveLandCrews,
+          drift: driftForPickup,
+        });
+        rankingsForAi.set(s.id, r);
+      }
       const result = await getCrewSuggestions({
-        sightings: sightingsDataRef.current,
-        vessels: vesselsDataRef.current,
+        sightings: liveSightings,
+        vessels: liveVessels,
+        landCrews: liveLandCrews,
         assignments: assignmentsDataRef.current,
         pendingHandoffs: pendingHandoffsRef.current,
+        crewRankings: rankingsForAi,
         supplies: suppliesDataRef.current,
       });
       setAiSuggestions(Array.isArray(result) ? result : [{ text: result, action_type: 'none' }]);
@@ -215,6 +311,105 @@ export default function Dashboard() {
     [pendingHandoffs],
   );
 
+  /**
+   * Ongoing missions = assignments not yet completed.
+   * Each mission gets a stable color (via colorForMissionId) so the sighting marker
+   * and the ship/land-crew working it match on the map and the sidebar.
+   */
+  const ongoingMissions = useMemo(() => {
+    return (assignments || [])
+      .filter((a) => a.status !== 'completed')
+      .map((a) => {
+        const sighting = sightings.find((s) => s.id === a.sighting_id) || null;
+        const vessel = a.vessel_id ? vessels.find((v) => v.id === a.vessel_id) : null;
+        let landCrew = a.land_crew_id ? landCrews.find((c) => c.id === a.land_crew_id) : null;
+        // Reconstruct a synthetic shore station from the assignment row when the assignment
+        // wasn't backed by a DB land_crew (auto-dispatched virtual patrol).
+        if (!landCrew
+          && a.crew_type === 'land'
+          && Number.isFinite(a.shore_station_lat)
+          && Number.isFinite(a.shore_station_lon)
+        ) {
+          landCrew = {
+            id: `synthetic-shore:${a.shore_station_lat.toFixed(3)}_${a.shore_station_lon.toFixed(3)}`,
+            name: a.shore_station_name || 'Shore patrol',
+            base_lat: a.shore_station_lat,
+            base_lon: a.shore_station_lon,
+            agency: 'ClearMarine Shore Network',
+            synthetic: true,
+            status: 'deployed',
+          };
+        }
+        return {
+          id: a.id,
+          color: colorForMissionId(a.id),
+          assignment: a,
+          sighting,
+          vessel,
+          landCrew,
+          crewType: a.crew_type || (vessel ? 'ship' : 'land'),
+          crewName: vessel?.name || landCrew?.name || '—',
+        };
+      })
+      .filter((m) => m.sighting); // only show missions where the sighting still exists
+  }, [assignments, sightings, vessels, landCrews]);
+
+  /** Map<sighting.id, mission> — quick lookup for icon coloring. */
+  const missionBySighting = useMemo(() => {
+    const m = new Map();
+    for (const mission of ongoingMissions) m.set(mission.sighting.id, mission);
+    return m;
+  }, [ongoingMissions]);
+
+  /** Map<vessel.id, mission> — quick lookup for vessel marker coloring. */
+  const missionByVessel = useMemo(() => {
+    const m = new Map();
+    for (const mission of ongoingMissions) {
+      if (mission.vessel) m.set(mission.vessel.id, mission);
+    }
+    return m;
+  }, [ongoingMissions]);
+
+  /**
+   * Map<sighting.id, { ranked, kg, kgSource, pickupKey, syntheticStation }>.
+   *
+   * For shore-pickup sightings ('ship_coast' or 'land') we synthesize ONE virtual shore
+   * station anchored at the predicted landfall point (or nearest shore) and add it to
+   * the candidate list. Real DB land_crews still compete on ETA — the synthetic one
+   * usually wins because it’s right at the coast next to the debris, satisfying the
+   * "pinned to spots close to it" requirement without needing the user to pre-seed crews.
+   */
+  const crewRankings = useMemo(() => {
+    const map = new Map();
+    for (const s of visibleSightings) {
+      const drift = drifts.find((d) => d.sighting_id === s.id) || null;
+      const driftForPickup = drift
+        ? {
+          lat_24h: drift.lat_24h, lon_24h: drift.lon_24h,
+          lat_48h: drift.lat_48h, lon_48h: drift.lon_48h,
+          lat_72h: drift.lat_72h, lon_72h: drift.lon_72h,
+        }
+        : null;
+      const pickup = classifyPickupMode(s.latitude, s.longitude, driftForPickup);
+      const wantsShoreCrew = pickup.key === 'ship_coast' || pickup.key === 'land';
+      const syntheticStation = wantsShoreCrew
+        ? synthesizeShoreStationForSighting(s, driftForPickup)
+        : null;
+      const effectiveLandCrews = syntheticStation
+        ? [syntheticStation, ...landCrews]
+        : landCrews;
+      const { ranked, kg, kgSource } = rankCrewsForSighting({
+        pickupKey: pickup.key,
+        sighting: s,
+        vessels,
+        landCrews: effectiveLandCrews,
+        drift: driftForPickup,
+      });
+      map.set(s.id, { ranked, kg, kgSource, pickupKey: pickup.key, syntheticStation });
+    }
+    return map;
+  }, [visibleSightings, vessels, landCrews, drifts]);
+
   useEffect(() => {
     if (selectedSightingId == null) return;
     if (!visibleSightings.some((s) => s.id === selectedSightingId)) {
@@ -236,7 +431,22 @@ export default function Dashboard() {
 
   useEffect(() => {
     myAgencyRef.current = myAgency;
-    void fetchData().then(() => scheduleAiRefresh());
+    void fetchData().then(() => {
+      scheduleAiRefresh();
+      if (hasFocusTarget) {
+        setMapFlyTarget({ lat: focusLat, lon: focusLon, zoom: 11, key: Date.now() });
+        const match = sightingsDataRef.current.find(
+          (s) => Math.abs(s.latitude - focusLat) < 0.001 && Math.abs(s.longitude - focusLon) < 0.001,
+        );
+        if (match) {
+          setSelectedSightingId(match.id);
+          setTimeout(() => {
+            sightingRefs.current[match.id]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }, 400);
+        }
+      }
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [myAgency, fetchData, scheduleAiRefresh]);
 
   // Realtime subscription (stable — uses refs internally)
@@ -260,42 +470,102 @@ export default function Dashboard() {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'drift_predictions' }, () => {
         void fetchData().then(() => scheduleAiRefresh());
       })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'land_crews' }, () => {
+        void fetchData().then(() => scheduleAiRefresh());
+      })
       .subscribe();
     return () => supabase.removeChannel(channel);
   }, [fetchData, scheduleAiRefresh]);
 
   const handleAssign = async () => {
-    if (!assignModal || !selectedVessel) return;
-    const vessel = vessels.find((v) => v.id === selectedVessel);
-    const intercept = await getInterceptionPoint(assignModal.latitude, assignModal.longitude, vessel.current_lat, vessel.current_lon);
-    if (!intercept) {
-      alert('Could not compute interception — check sighting and vessel coordinates.');
-      return;
-    }
-    const brief = await generateAssignmentBrief({
-      vesselName: vessel.name,
-      debrisType: assignModal.debris_type,
-      densityLabel: assignModal.density_label,
-      interceptionHours: intercept.hours,
-      lat: intercept.lat,
-      lon: intercept.lon,
-    });
-    await Promise.all([
-      supabase.from('assignments').insert({
+    if (!assignModal || !selectedCrew) return;
+    const ranking = crewRankings.get(assignModal.id);
+    const est = ranking?.ranked.find((r) => r.crewId === selectedCrew.id && r.crewType === selectedCrew.type);
+
+    if (selectedCrew.type === 'ship') {
+      const vessel = vessels.find((v) => v.id === selectedCrew.id);
+      if (!vessel) return;
+      const intercept = await getInterceptionPoint(
+        assignModal.latitude, assignModal.longitude, vessel.current_lat, vessel.current_lon,
+      );
+      if (!intercept) {
+        alert('Could not compute interception — check sighting and vessel coordinates.');
+        return;
+      }
+      const brief = await generateAssignmentBrief({
+        vesselName: vessel.name,
+        debrisType: assignModal.debris_type,
+        densityLabel: assignModal.density_label,
+        interceptionHours: intercept.hours,
+        lat: intercept.lat,
+        lon: intercept.lon,
+      });
+      await Promise.all([
+        supabase.from('assignments').insert({
+          sighting_id: assignModal.id,
+          vessel_id: vessel.id,
+          crew_type: 'ship',
+          interception_lat: intercept.lat,
+          interception_lon: intercept.lon,
+          interception_hours: intercept.hours,
+          estimated_kg: est?.kg ?? null,
+          estimated_trips: est?.trips ?? null,
+          total_minutes: est?.totalMinutes ?? null,
+          status: 'assigned',
+          gemini_brief: brief,
+        }),
+        supabase.from('debris_sightings').update({ status: 'assigned' }).eq('id', assignModal.id),
+        supabase.from('vessels').update({ status: 'deployed', updated_at: new Date().toISOString() }).eq('id', vessel.id),
+      ]);
+      setBriefModal({ brief, crewName: vessel.name, crewType: 'ship', sighting: assignModal, intercept, est });
+    } else {
+      // Look up the crew either in real DB land crews OR in the synthetic station for this sighting.
+      const synthetic = isSyntheticShoreId(selectedCrew.id);
+      const crew = synthetic
+        ? ranking?.syntheticStation
+        : landCrews.find((c) => c.id === selectedCrew.id);
+      if (!crew) return;
+      const brief = await generateAssignmentBrief({
+        vesselName: `${crew.name} (shore crew)`,
+        debrisType: assignModal.debris_type,
+        densityLabel: assignModal.density_label,
+        interceptionHours: 0,
+        lat: assignModal.latitude,
+        lon: assignModal.longitude,
+      });
+      const insertPayload = {
         sighting_id: assignModal.id,
-        vessel_id: selectedVessel,
-        interception_lat: intercept.lat,
-        interception_lon: intercept.lon,
-        interception_hours: intercept.hours,
+        land_crew_id: synthetic ? null : crew.id,
+        crew_type: 'land',
+        interception_lat: assignModal.latitude,
+        interception_lon: assignModal.longitude,
+        interception_hours: 0,
+        estimated_kg: est?.kg ?? null,
+        estimated_trips: est?.trips ?? null,
+        total_minutes: est?.totalMinutes ?? null,
         status: 'assigned',
         gemini_brief: brief,
-      }),
-      supabase.from('debris_sightings').update({ status: 'assigned' }).eq('id', assignModal.id),
-      supabase.from('vessels').update({ status: 'deployed', updated_at: new Date().toISOString() }).eq('id', selectedVessel),
-    ]);
-    setBriefModal({ brief, vessel: vessel.name, sighting: assignModal, intercept });
+      };
+      if (synthetic) {
+        insertPayload.shore_station_lat = crew.base_lat;
+        insertPayload.shore_station_lon = crew.base_lon;
+        insertPayload.shore_station_name = crew.name;
+      }
+      const followups = [
+        supabase.from('assignments').insert(insertPayload),
+        supabase.from('debris_sightings').update({ status: 'assigned' }).eq('id', assignModal.id),
+      ];
+      if (!synthetic) {
+        followups.push(
+          supabase.from('land_crews').update({ status: 'deployed', updated_at: new Date().toISOString() }).eq('id', crew.id),
+        );
+      }
+      await Promise.all(followups);
+      setBriefModal({ brief, crewName: crew.name, crewType: 'land', sighting: assignModal, intercept: null, est });
+    }
+
     setAssignModal(null);
-    setSelectedVessel('');
+    setSelectedCrew(null);
     await fetchData();
     fireAiSuggestions();
   };
@@ -340,6 +610,145 @@ export default function Dashboard() {
     fireAiSuggestions();
   };
 
+  /** Click a mission card → highlight on map + scroll its sighting into view. */
+  const selectMission = useCallback((mission) => {
+    if (!mission) return;
+    setSelectedMissionId(mission.id);
+    setSelectedSightingId(mission.sighting.id);
+    setMapFlyTarget({ lat: mission.sighting.latitude, lon: mission.sighting.longitude, zoom: 9, key: Date.now() });
+    setTimeout(() => {
+      sightingRefs.current[mission.sighting.id]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 350);
+  }, []);
+
+  /** Mark a mission cleared: sighting cleared, assignment completed, vessel/land crew freed. */
+  const completeMission = useCallback(async (mission) => {
+    if (!mission) return;
+    const tasks = [
+      supabase.from('debris_sightings').update({ status: 'cleared' }).eq('id', mission.sighting.id),
+      supabase.from('assignments').update({ status: 'completed' }).eq('id', mission.id),
+    ];
+    if (mission.vessel) {
+      tasks.push(
+        supabase.from('vessels').update({ status: 'available', updated_at: new Date().toISOString() }).eq('id', mission.vessel.id),
+      );
+    }
+    if (mission.landCrew && !mission.landCrew.synthetic) {
+      tasks.push(
+        supabase.from('land_crews').update({ status: 'available', updated_at: new Date().toISOString() }).eq('id', mission.landCrew.id),
+      );
+    }
+    await Promise.all(tasks);
+    setSelectedMissionId((cur) => (cur === mission.id ? null : cur));
+    await fetchData();
+    fireAiSuggestions();
+  }, [fetchData, fireAiSuggestions]);
+
+  // Drop selectedMissionId if the mission disappeared (cleared, etc.)
+  useEffect(() => {
+    if (selectedMissionId == null) return;
+    if (!ongoingMissions.some((m) => m.id === selectedMissionId)) setSelectedMissionId(null);
+  }, [ongoingMissions, selectedMissionId]);
+
+  /**
+   * Auto-dispatch shore-crew missions for sightings whose drift forecast reaches land
+   * (pickup mode 'ship_coast') or that are already on land ('land'). The closest available
+   * land crew gets assigned automatically the moment the sighting + drift land in the
+   * dashboard. Ships are NEVER auto-dispatched — only shore teams get this lane, since
+   * the user wants flagged trash handled by ground crews by default.
+   */
+  useEffect(() => {
+    const assignedSightingIds = new Set(
+      (assignments || [])
+        .filter((a) => a.status !== 'completed')
+        .map((a) => a.sighting_id),
+    );
+
+    const candidates = visibleSightings.filter((s) => {
+      if (s.status !== 'reported') return false;
+      if (assignedSightingIds.has(s.id)) return false;
+      if (autoDispatchInFlightRef.current.has(s.id)) return false;
+      const ranking = crewRankings.get(s.id);
+      if (!ranking) return false;
+      if (ranking.pickupKey !== 'ship_coast' && ranking.pickupKey !== 'land') return false;
+      // Pick the best LAND option (rankings already put land first for ship_coast).
+      const bestLand = ranking.ranked.find((r) => r.crewType === 'land');
+      if (!bestLand) return false;
+      return true;
+    });
+
+    if (candidates.length === 0) return;
+
+    (async () => {
+      for (const sighting of candidates) {
+        autoDispatchInFlightRef.current.add(sighting.id);
+        try {
+          const ranking = crewRankings.get(sighting.id);
+          const bestLand = ranking?.ranked.find((r) => r.crewType === 'land');
+          if (!bestLand) continue;
+          const crew = bestLand.crew;
+          const synthetic = isSyntheticShoreId(crew.id);
+          // Real crews need to be available; synthetic stations are always on-call.
+          if (!synthetic && crew.status !== 'available') continue;
+
+          let brief = '';
+          try {
+            brief = await generateAssignmentBrief({
+              vesselName: `${crew.name} (shore crew, auto-dispatched)`,
+              debrisType: sighting.debris_type,
+              densityLabel: sighting.density_label,
+              interceptionHours: 0,
+              lat: sighting.latitude,
+              lon: sighting.longitude,
+            });
+          } catch (e) {
+            console.warn('Auto-dispatch brief generation failed; continuing without brief.', e);
+          }
+
+          const insertPayload = {
+            sighting_id: sighting.id,
+            land_crew_id: synthetic ? null : crew.id,
+            crew_type: 'land',
+            interception_lat: sighting.latitude,
+            interception_lon: sighting.longitude,
+            interception_hours: 0,
+            estimated_kg: bestLand.kg ?? null,
+            estimated_trips: bestLand.trips ?? null,
+            total_minutes: bestLand.totalMinutes ?? null,
+            status: 'assigned',
+            gemini_brief: brief || `Auto-dispatched: ${crew.name} → ${sighting.debris_type} cleanup.`,
+          };
+          if (synthetic) {
+            insertPayload.shore_station_lat = crew.base_lat;
+            insertPayload.shore_station_lon = crew.base_lon;
+            insertPayload.shore_station_name = crew.name;
+          }
+          const { error: insertErr } = await supabase.from('assignments').insert(insertPayload);
+          if (insertErr) {
+            console.error('Auto-dispatch insert failed', insertErr);
+            continue;
+          }
+          const followups = [
+            supabase.from('debris_sightings').update({ status: 'assigned' }).eq('id', sighting.id),
+          ];
+          if (!synthetic) {
+            followups.push(
+              supabase.from('land_crews').update({ status: 'deployed', updated_at: new Date().toISOString() }).eq('id', crew.id),
+            );
+          }
+          await Promise.all(followups);
+        } catch (e) {
+          console.error('Auto-dispatch failed for sighting', sighting.id, e);
+        } finally {
+          autoDispatchInFlightRef.current.delete(sighting.id);
+        }
+      }
+      await fetchData();
+      fireAiSuggestions();
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleSightings, crewRankings, assignments, landCrews]);
+
   const executeAction = async (s, idx) => {
     setExecutingAction(idx);
     try {
@@ -351,7 +760,16 @@ export default function Dashboard() {
         }
         const sighting = s.sighting_id ? sightings.find((x) => x.id === s.sighting_id) : sightings[0];
         const vessel = s.vessel_id ? vessels.find((v) => v.id === s.vessel_id) : available[0];
-        if (sighting && vessel) { setAssignModal(sighting); setSelectedVessel(vessel.id); }
+        if (sighting && vessel) { setAssignModal(sighting); setSelectedCrew({ type: 'ship', id: vessel.id }); }
+      } else if (s.action_type === 'assign_land_crew') {
+        const available = landCrews.filter((c) => c.status === 'available');
+        if (available.length === 0) {
+          alert('No land crews available right now. Free a team from deployment or wait for one returning.');
+          return;
+        }
+        const sighting = s.sighting_id ? sightings.find((x) => x.id === s.sighting_id) : sightings[0];
+        const crew = s.land_crew_id ? landCrews.find((c) => c.id === s.land_crew_id) : available[0];
+        if (sighting && crew) { setAssignModal(sighting); setSelectedCrew({ type: 'land', id: crew.id }); }
       } else if (s.action_type === 'accept_handoff') {
         const h = s.handoff_id ? pendingHandoffs.find((x) => x.id === s.handoff_id) : pendingHandoffs[0];
         if (h) await acceptHandoff(h);
@@ -482,11 +900,14 @@ export default function Dashboard() {
               const isSelected = selectedSightingId === s.id;
               const landfallCoords = lf.landfallPoint ? formatCoordPair(lf.landfallPoint[0], lf.landfallPoint[1]) : null;
 
+              const sightingMission = missionBySighting.get(s.id) || null;
+              const sightingMissionColor = sightingMission?.color || null;
+              const sightingMissionSelected = sightingMission && selectedMissionId === sightingMission.id;
               return (
                 <div key={s.id}>
                   <Marker
                     position={[s.latitude, s.longitude]}
-                    icon={debrisIcon(s.density_score, isSelected)}
+                    icon={debrisIcon(s.density_score, isSelected || sightingMissionSelected, sightingMissionColor)}
                     eventHandlers={{ click: () => clickMarker(s) }}
                   >
                     <Popup>
@@ -495,8 +916,27 @@ export default function Dashboard() {
                           <span className={`font-bold px-1.5 py-0.5 rounded ${pickupBadgeClassName(pickup.key)}`}>
                             {pickup.shortLabel}
                           </span>
+                          {sightingMission && (
+                            <span
+                              className="ml-1 inline-block text-[10px] font-bold px-1.5 py-0.5 rounded text-white"
+                              style={{ backgroundColor: sightingMission.color }}
+                            >
+                              ● Mission · {sightingMission.crewName}
+                            </span>
+                          )}
                         </p>
                         <p className="text-gray-600 leading-snug">{pickup.detail}</p>
+                        {(() => {
+                          const r = crewRankings.get(s.id);
+                          const best = r?.ranked?.[0];
+                          if (!best) return null;
+                          return (
+                            <p className="text-emerald-700 font-semibold">
+                              Best ETA: {formatEtaShort(best.totalMinutes)} via {best.crewName}
+                              <span className="text-gray-600 font-normal"> ({best.trips} trip{best.trips === 1 ? '' : 's'}, ~{Math.round(best.kg)} kg)</span>
+                            </p>
+                          );
+                        })()}
                         <p className="font-bold">{s.density_label} — {s.debris_type?.replace('_', ' ')}</p>
                         <p className="text-gray-600">{s.gemini_analysis?.slice(0, 120)}...</p>
                         <p className="text-gray-500">By: {s.reporter_name}</p>
@@ -541,10 +981,10 @@ export default function Dashboard() {
                         center={lf.landfallPoint}
                         radius={16000}
                         pathOptions={{
-                          color: '#ea580c',
-                          fillColor: '#f97316',
-                          fillOpacity: 0.38,
-                          weight: 3,
+                          color: sightingMissionColor || '#ea580c',
+                          fillColor: sightingMissionColor || '#f97316',
+                          fillOpacity: sightingMission ? 0.45 : 0.38,
+                          weight: sightingMission ? 4 : 3,
                         }}
                       />
                       <Marker position={lf.landfallPoint} icon={landfallIcon}>
@@ -553,6 +993,11 @@ export default function Dashboard() {
                           <p className="text-xs text-gray-600">{lf.landfallLabel}</p>
                           <p className="text-xs text-gray-700 font-mono font-bold">{formatCoordPair(lf.landfallPoint[0], lf.landfallPoint[1])}</p>
                           <p className="text-xs text-amber-800 font-medium">{lf.coastAlert}</p>
+                          {sightingMission && (
+                            <p className="text-xs font-bold mt-1" style={{ color: sightingMission.color }}>
+                              ● Shore crew on mission: {sightingMission.crewName}
+                            </p>
+                          )}
                         </Popup>
                       </Marker>
                     </>
@@ -561,30 +1006,94 @@ export default function Dashboard() {
               );
             })}
 
-            {vessels.filter((v) => v.current_lat && v.current_lon).map((v) => (
-              <Marker key={v.id} position={[v.current_lat, v.current_lon]} icon={vesselIcon}>
-                <Popup>
-                  <div className="text-xs space-y-1">
-                    <p className="font-bold">{v.name}</p>
-                    <p>{v.zone}</p>
-                    <p>Status: {v.status} | Fuel: {v.fuel_level}%</p>
-                    <p className="font-mono text-gray-400">{formatCoordPair(v.current_lat, v.current_lon)}</p>
-                  </div>
-                </Popup>
-              </Marker>
-            ))}
+            {vessels.filter((v) => v.current_lat && v.current_lon).map((v) => {
+              const vesselMission = missionByVessel.get(v.id) || null;
+              const vesselMissionColor = vesselMission?.color || null;
+              const vesselMissionSelected = vesselMission && selectedMissionId === vesselMission.id;
+              return (
+                <Marker
+                  key={v.id}
+                  position={[v.current_lat, v.current_lon]}
+                  icon={vesselIcon(vesselMissionColor, !!vesselMissionSelected)}
+                  eventHandlers={vesselMission ? { click: () => selectMission(vesselMission) } : undefined}
+                >
+                  <Popup>
+                    <div className="text-xs space-y-1">
+                      <p className="font-bold">{v.name}</p>
+                      <p>{v.zone}</p>
+                      <p>Status: {v.status} | Fuel: {v.fuel_level}%</p>
+                      <p className="font-mono text-gray-400">{formatCoordPair(v.current_lat, v.current_lon)}</p>
+                      {vesselMission && (
+                        <p className="font-semibold" style={{ color: vesselMission.color }}>
+                          ● On mission to {vesselMission.sighting?.debris_type?.replace('_', ' ')}
+                        </p>
+                      )}
+                    </div>
+                  </Popup>
+                </Marker>
+              );
+            })}
+
+            {/* Mission connector lines + land crew base markers */}
+            {ongoingMissions.map((m) => {
+              const isSelected = selectedMissionId === m.id;
+              const weight = isSelected ? 4 : 2;
+              const opacity = isSelected ? 1 : 0.55;
+              const dash = isSelected ? null : '8,6';
+              const elements = [];
+              if (m.vessel?.current_lat && m.vessel?.current_lon
+                && Number.isFinite(m.assignment.interception_lat)
+                && Number.isFinite(m.assignment.interception_lon)) {
+                elements.push(
+                  <Polyline
+                    key={`mission-${m.id}-vessel`}
+                    positions={[[m.vessel.current_lat, m.vessel.current_lon], [m.assignment.interception_lat, m.assignment.interception_lon]]}
+                    pathOptions={{ color: m.color, weight, opacity, ...(dash ? { dashArray: dash } : {}) }}
+                  />
+                );
+              }
+              if (m.landCrew?.base_lat && m.landCrew?.base_lon && m.sighting) {
+                elements.push(
+                  <Polyline
+                    key={`mission-${m.id}-land`}
+                    positions={[[m.landCrew.base_lat, m.landCrew.base_lon], [m.sighting.latitude, m.sighting.longitude]]}
+                    pathOptions={{ color: m.color, weight, opacity, ...(dash ? { dashArray: dash } : {}) }}
+                  />,
+                  <Marker
+                    key={`mission-${m.id}-landbase`}
+                    position={[m.landCrew.base_lat, m.landCrew.base_lon]}
+                    icon={landCrewIcon(m.color, isSelected)}
+                    eventHandlers={{ click: () => selectMission(m) }}
+                  >
+                    <Popup>
+                      <div className="text-xs space-y-1">
+                        <p className="font-bold">{m.landCrew.name}</p>
+                        <p className="text-gray-600">Land crew base</p>
+                        <p className="font-semibold" style={{ color: m.color }}>● Dispatched to active sighting</p>
+                      </div>
+                    </Popup>
+                  </Marker>
+                );
+              }
+              return elements;
+            })}
           </MapContainer>
 
           {/* Coordinate display */}
           <div className="absolute bottom-4 left-4 bg-slate-900 bg-opacity-90 rounded-xl p-3 text-xs space-y-1 z-[1000] min-w-[200px] pointer-events-none">
             <p className="text-slate-400 font-semibold mb-1">Drift forecast</p>
-            <p className="text-slate-500 leading-snug mb-1">Track follows surface current; clipped at shore — not inland.</p>
-            <p className="text-slate-500 leading-snug mb-1">Sightings on land (Pacific model) are hidden from the map.</p>
-            <p className="text-slate-500 leading-snug mb-1">Badges: Land / Ship / Ship+coast use drift + shoreline (same as report pipeline).</p>
+            <p className="text-slate-500 leading-snug mb-1">Track follows surface current — capped at realistic speed and clipped at the first coast it touches (NE Pacific shoreline or global land mask).</p>
+            <p className="text-slate-500 leading-snug mb-1">Badges: Ship / Ship+coast use drift + shoreline (same as report pipeline).</p>
             <div className="flex items-center gap-2"><div className="w-6 h-0.5 bg-yellow-400" /><span className="text-slate-300">24h</span></div>
             <div className="flex items-center gap-2"><div className="w-6 h-0.5 bg-orange-500" /><span className="text-slate-300">48h</span></div>
             <div className="flex items-center gap-2"><div className="w-6 h-0.5 bg-red-500" /><span className="text-slate-300">72h</span></div>
             <div className="flex items-center gap-2"><span className="text-orange-400">⚑</span><span className="text-slate-300">Shore only if track reaches coast</span></div>
+            {ongoingMissions.length > 0 && (
+              <div className="flex items-center gap-2 pt-1 border-t border-slate-700 mt-1">
+                <span className="inline-block w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                <span className="text-emerald-300">{ongoingMissions.length} active mission{ongoingMissions.length === 1 ? '' : 's'} — colored rings link sighting ↔ crew</span>
+              </div>
+            )}
             <div className="pt-1 border-t border-slate-700 mt-1 space-y-0.5">
               <p className="text-slate-500">Hover or click map</p>
               {hoverCoords && (
@@ -600,10 +1109,11 @@ export default function Dashboard() {
         {/* Sidebar */}
         <div className="w-80 bg-slate-800 border-l border-slate-700 flex flex-col overflow-hidden shrink-0">
           <div className="flex border-b border-slate-700">
-            {['sightings', 'vessels', 'supplies'].map((t) => (
+            {['missions', 'sightings', 'vessels', 'supplies'].map((t) => (
               <button key={t} onClick={() => setActiveTab(t)}
                 className={`flex-1 py-2 text-xs font-medium capitalize transition-colors ${activeTab === t ? 'border-b-2 border-cyan-500 text-cyan-400' : 'text-slate-400 hover:text-slate-200'}`}>
                 {t}
+                {t === 'missions' && ongoingMissions.length > 0 && <span className="ml-1 bg-emerald-700 text-emerald-100 px-1 rounded animate-pulse">{ongoingMissions.length}</span>}
                 {t === 'sightings' && visibleSightings.length > 0 && <span className="ml-1 bg-slate-700 px-1 rounded">{visibleSightings.length}</span>}
                 {t === 'supplies' && lowSupplies.length > 0 && <span className="ml-1 bg-red-700 text-white px-1 rounded">{lowSupplies.length}</span>}
               </button>
@@ -651,6 +1161,82 @@ export default function Dashboard() {
 
           {/* Tab Content */}
           <div className="flex-1 overflow-y-auto p-3 space-y-2">
+            {activeTab === 'missions' && (
+              <>
+                {ongoingMissions.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-slate-700 p-4 text-center">
+                    <p className="text-slate-400 text-sm font-semibold">No ongoing missions</p>
+                    <p className="text-slate-500 text-xs mt-1 leading-snug">Dispatch a crew from the Sightings tab to start a mission. Active missions show here with a color-coded link to their crew on the map.</p>
+                  </div>
+                ) : (
+                  <>
+                    <p className="text-emerald-400 text-xs font-semibold uppercase tracking-wider mb-1 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse" />
+                      Active Missions ({ongoingMissions.length})
+                    </p>
+                    {ongoingMissions.map((m) => {
+                      const isSelected = selectedMissionId === m.id;
+                      const eta = Number.isFinite(m.assignment.total_minutes) ? formatEtaShort(m.assignment.total_minutes) : null;
+                      const kg = Number.isFinite(m.assignment.estimated_kg) ? Math.round(m.assignment.estimated_kg) : null;
+                      const trips = Number.isFinite(m.assignment.estimated_trips) ? m.assignment.estimated_trips : null;
+                      return (
+                        <div
+                          key={m.id}
+                          onClick={() => selectMission(m)}
+                          className={`rounded-xl p-3 border-l-4 cursor-pointer transition-all bg-slate-700/60 hover:bg-slate-700 ${isSelected ? 'ring-2 ring-offset-2 ring-offset-slate-800' : ''}`}
+                          style={{
+                            borderLeftColor: m.color,
+                            ...(isSelected ? { '--tw-ring-color': m.color, boxShadow: `0 0 0 1px ${m.color}66, 0 0 18px ${m.color}55` } : {}),
+                          }}
+                        >
+                          <div className="flex items-center justify-between gap-2 mb-1">
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <span
+                                className="inline-block w-2.5 h-2.5 rounded-full shrink-0"
+                                style={{ backgroundColor: m.color, boxShadow: `0 0 6px ${m.color}` }}
+                              />
+                              <span className="text-white text-sm font-semibold truncate">{m.crewName}</span>
+                              <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 ${m.crewType === 'ship' ? 'bg-cyan-950 text-cyan-200 border border-cyan-700' : 'bg-amber-950 text-amber-200 border border-amber-700'}`}>
+                                {m.crewType === 'ship' ? '🚢 Ship' : '🥾 Shore'}
+                              </span>
+                            </div>
+                            {eta && <span className="text-cyan-300 font-mono text-xs shrink-0">{eta}</span>}
+                          </div>
+                          <p className="text-slate-300 text-xs capitalize">
+                            {m.sighting.density_label} {m.sighting.debris_type?.replace('_', ' ')}
+                          </p>
+                          <p className="text-slate-500 text-[11px] font-mono">
+                            {formatCoordPair(m.sighting.latitude, m.sighting.longitude)}
+                          </p>
+                          {(kg || trips) && (
+                            <p className="text-slate-400 text-[11px] mt-0.5">
+                              {kg ? `~${kg} kg` : ''}
+                              {kg && trips ? ' · ' : ''}
+                              {trips ? `${trips} trip${trips === 1 ? '' : 's'}` : ''}
+                            </p>
+                          )}
+                          <div className="flex gap-1 mt-2" onClick={(e) => e.stopPropagation()}>
+                            <button
+                              onClick={() => completeMission(m)}
+                              className="flex-1 bg-green-700 hover:bg-green-600 text-white text-xs font-semibold py-1 rounded-lg transition-colors"
+                            >
+                              ✓ Complete
+                            </button>
+                            <button
+                              onClick={() => selectMission(m)}
+                              className="flex-1 bg-slate-600 hover:bg-slate-500 text-slate-100 text-xs py-1 rounded-lg transition-colors"
+                            >
+                              Focus map
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </>
+                )}
+              </>
+            )}
+
             {activeTab === 'sightings' && pendingHandoffs.length > 0 && (
               <div className="space-y-2 mb-2">
                 <p className="text-yellow-400 text-xs font-semibold uppercase tracking-wider">Incoming Handoffs → {myAgency}</p>
@@ -703,6 +1289,33 @@ export default function Dashboard() {
                         <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${pickupBadgeClassName(pickup.key)}`} title={pickup.detail}>
                           {pickup.shortLabel}
                         </span>
+                        {(() => {
+                          const mission = missionBySighting.get(s.id);
+                          if (!mission) return null;
+                          return (
+                            <span
+                              className="text-[10px] font-bold px-1.5 py-0.5 rounded text-white shrink-0 cursor-pointer"
+                              style={{ backgroundColor: mission.color, boxShadow: `0 0 6px ${mission.color}aa` }}
+                              title={`Mission · ${mission.crewName}`}
+                              onClick={(e) => { e.stopPropagation(); selectMission(mission); }}
+                            >
+                              ● Mission · {mission.crewName}
+                            </span>
+                          );
+                        })()}
+                        {(() => {
+                          const r = crewRankings.get(s.id);
+                          const best = r?.ranked?.[0];
+                          if (!best || missionBySighting.has(s.id)) return null;
+                          return (
+                            <span
+                              className="text-[10px] font-semibold px-1.5 py-0.5 rounded border border-emerald-700 bg-emerald-950 text-emerald-200"
+                              title={`${best.crewName} (${best.crewType}) — ${best.trips} trip${best.trips === 1 ? '' : 's'}, ~${Math.round(best.kg)} kg`}
+                            >
+                              ETA {formatEtaShort(best.totalMinutes)} · {best.crewType === 'ship' ? '🚢' : '🥾'} {best.crewName}
+                            </span>
+                          );
+                        })()}
                       </div>
                       <div className="flex items-center gap-1.5 flex-wrap">
                         <span className={`text-xs font-bold px-1.5 py-0.5 rounded-full ${densityBadge(s.density_score, s.density_label)}`}>
@@ -729,14 +1342,20 @@ export default function Dashboard() {
                       </div>
                     </div>
                     <div className="flex flex-col gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
-                      <button
-                        onClick={() => setAssignModal(s)}
-                        disabled={availableFleet.length === 0}
-                        title={availableFleet.length === 0 ? 'No vessel available' : ''}
-                        className="bg-cyan-700 hover:bg-cyan-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs px-2 py-1 rounded-lg"
-                      >
-                        Assign
-                      </button>
+                      {(() => {
+                        const r = crewRankings.get(s.id);
+                        const hasOptions = (r?.ranked?.length || 0) > 0;
+                        return (
+                          <button
+                            onClick={() => setAssignModal(s)}
+                            disabled={!hasOptions}
+                            title={!hasOptions ? 'No crew available for this pickup mode' : ''}
+                            className="bg-cyan-700 hover:bg-cyan-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs px-2 py-1 rounded-lg"
+                          >
+                            Dispatch
+                          </button>
+                        );
+                      })()}
                       <select
                         onChange={(e) => e.target.value && handleHandoff(s, e.target.value)}
                         value=""
@@ -878,43 +1497,101 @@ export default function Dashboard() {
       </div>
 
       {/* Assign Modal */}
-      {assignModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center p-4 z-50">
-          <div className="bg-slate-800 rounded-2xl p-6 max-w-md w-full border border-slate-600 shadow-2xl">
-            <h3 className="text-white font-bold text-lg mb-1">Assign Cleanup Crew</h3>
-            <p className="text-slate-400 text-sm mb-4">{assignModal.density_label} {assignModal.debris_type?.replace('_', ' ')} cluster</p>
-            {availableFleet.length === 0 ? (
-              <p className="text-amber-300 text-sm mb-4">No vessels in &quot;available&quot; status. Mark a crew as available or wait for a returning hull.</p>
-            ) : (
-              <select value={selectedVessel} onChange={(e) => setSelectedVessel(e.target.value)}
-                className="w-full bg-slate-700 text-white rounded-xl px-4 py-3 mb-4 focus:outline-none focus:ring-2 focus:ring-cyan-500">
-                <option value="">Select vessel...</option>
-                {availableFleet.map((v) => (
-                  <option key={v.id} value={v.id}>{v.name} — {v.zone} (⛽ {v.fuel_level}%)</option>
-                ))}
-              </select>
-            )}
-            <div className="flex gap-2">
-              <button onClick={() => { setAssignModal(null); setSelectedVessel(''); }}
-                className="flex-1 bg-slate-700 hover:bg-slate-600 text-white py-2.5 rounded-xl transition-colors">Cancel</button>
-              <button onClick={handleAssign} disabled={!selectedVessel || availableFleet.length === 0}
-                className="flex-1 bg-cyan-600 hover:bg-cyan-700 disabled:opacity-40 text-white font-semibold py-2.5 rounded-xl transition-colors">
-                Assign + Generate Brief
-              </button>
+      {assignModal && (() => {
+        const ranking = crewRankings.get(assignModal.id);
+        const ranked = ranking?.ranked || [];
+        const kg = ranking?.kg ?? 0;
+        const kgSource = ranking?.kgSource;
+        const pickupKey = ranking?.pickupKey;
+        const noOptions = ranked.length === 0;
+        return (
+          <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center p-4 z-50">
+            <div className="bg-slate-800 rounded-2xl p-6 max-w-lg w-full border border-slate-600 shadow-2xl max-h-[90vh] overflow-y-auto">
+              <h3 className="text-white font-bold text-lg mb-1">Dispatch Cleanup Crew</h3>
+              <p className="text-slate-400 text-sm mb-1">{assignModal.density_label} {assignModal.debris_type?.replace('_', ' ')} cluster</p>
+              <p className="text-slate-500 text-xs mb-4">
+                Site mass est: <span className="text-slate-300 font-mono">{Math.round(kg)} kg</span>
+                <span className="text-slate-600"> ({kgSource === 'string' ? 'from volume string' : kgSource === 'patch' ? 'from patch length' : 'from density × type'})</span>
+                {pickupKey && (
+                  <span className={`ml-2 inline-block text-[10px] font-semibold px-1.5 py-0.5 rounded ${pickupBadgeClassName(pickupKey)}`}>
+                    {pickupKey === 'land' ? 'Land pickup' : pickupKey === 'ship' ? 'Ship pickup' : pickupKey === 'ship_coast' ? 'Ship + coast' : 'Verify'}
+                  </span>
+                )}
+              </p>
+              {noOptions ? (
+                <p className="text-amber-300 text-sm mb-4 leading-snug">
+                  No crews currently available for this pickup mode. Free a vessel/team or wait for a returning crew.
+                </p>
+              ) : (
+                <div className="space-y-2 mb-4">
+                  {ranked.slice(0, 5).map((opt, i) => {
+                    const isSelected = selectedCrew?.type === opt.crewType && selectedCrew?.id === opt.crewId;
+                    const isBest = i === 0;
+                    const detail = opt.crewType === 'ship'
+                      ? `${opt.breakdown.distanceNm} nm transit · ${opt.breakdown.onsiteMinPerTrip} min on-site/trip`
+                      : `${opt.breakdown.distanceKm} km drive · ${opt.breakdown.onsiteMinPerTrip} min on-site/trip · ${opt.breakdown.responseMin} min mobilize`;
+                    return (
+                      <button
+                        key={`${opt.crewType}-${opt.crewId}`}
+                        type="button"
+                        onClick={() => setSelectedCrew({ type: opt.crewType, id: opt.crewId })}
+                        className={`w-full text-left rounded-xl p-3 border transition-colors ${isSelected ? 'border-cyan-500 bg-cyan-950/40' : 'border-slate-600 bg-slate-900 hover:bg-slate-700/50'}`}
+                      >
+                        <div className="flex items-start justify-between gap-2 mb-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${opt.crewType === 'ship' ? 'bg-cyan-950 text-cyan-200 border border-cyan-700' : 'bg-amber-950 text-amber-200 border border-amber-700'}`}>
+                              {opt.crewType === 'ship' ? 'Ship' : 'Shore'}
+                            </span>
+                            <span className="text-white text-sm font-semibold">{opt.crewName}</span>
+                            {isBest && <span className="text-[10px] bg-emerald-700 text-emerald-100 px-1.5 py-0.5 rounded">Fastest</span>}
+                          </div>
+                          <span className="text-cyan-300 font-mono text-sm shrink-0">{formatEtaShort(opt.totalMinutes)}</span>
+                        </div>
+                        <p className="text-slate-400 text-xs leading-snug">
+                          {opt.trips} trip{opt.trips === 1 ? '' : 's'} · ~{Math.round(opt.kg)} kg total
+                        </p>
+                        <p className="text-slate-500 text-[11px] leading-snug mt-0.5">{detail}</p>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              <div className="flex gap-2">
+                <button onClick={() => { setAssignModal(null); setSelectedCrew(null); }}
+                  className="flex-1 bg-slate-700 hover:bg-slate-600 text-white py-2.5 rounded-xl transition-colors">Cancel</button>
+                <button onClick={handleAssign} disabled={!selectedCrew || noOptions}
+                  className="flex-1 bg-cyan-600 hover:bg-cyan-700 disabled:opacity-40 text-white font-semibold py-2.5 rounded-xl transition-colors">
+                  Dispatch + Generate Brief
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Assignment Brief Modal */}
       {briefModal && (
         <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center p-4 z-50">
           <div className="bg-slate-800 rounded-2xl p-6 max-w-md w-full border border-slate-600 shadow-2xl">
-            <h3 className="text-white font-bold text-lg mb-1">Crew Brief — {briefModal.vessel}</h3>
-            <p className="text-slate-400 text-sm mb-3">
-              Intercept in {briefModal.intercept.hours}h at{' '}
-              <span className="font-mono text-cyan-300">{formatCoordPair(briefModal.intercept.lat, briefModal.intercept.lon)}</span>
+            <h3 className="text-white font-bold text-lg mb-1">Crew Brief — {briefModal.crewName}</h3>
+            <p className="text-slate-400 text-sm mb-1">
+              {briefModal.crewType === 'ship' && briefModal.intercept ? (
+                <>
+                  Intercept in {briefModal.intercept.hours}h at{' '}
+                  <span className="font-mono text-cyan-300">{formatCoordPair(briefModal.intercept.lat, briefModal.intercept.lon)}</span>
+                </>
+              ) : (
+                <>
+                  Land pickup at{' '}
+                  <span className="font-mono text-cyan-300">{formatCoordPair(briefModal.sighting.latitude, briefModal.sighting.longitude)}</span>
+                </>
+              )}
             </p>
+            {briefModal.est && (
+              <p className="text-slate-500 text-xs mb-3">
+                Estimate: <span className="text-slate-300 font-mono">~{Math.round(briefModal.est.kg)} kg · {briefModal.est.trips} trip{briefModal.est.trips === 1 ? '' : 's'} · {formatEtaShort(briefModal.est.totalMinutes)}</span>
+              </p>
+            )}
             <div className="bg-slate-900 rounded-xl p-4 mb-4">
               <p className="text-slate-300 text-sm leading-relaxed whitespace-pre-wrap">{briefModal.brief}</p>
             </div>
