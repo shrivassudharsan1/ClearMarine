@@ -1,22 +1,24 @@
-# Roboflow Proxy API
+# Backend API (Roboflow + ElevenLabs)
 
-Secure backend proxy for Roboflow inference so the API key never reaches the browser.
+Backend endpoints for Roboflow detection plus ElevenLabs transcription and text-to-speech.
 
 ## Setup
 
-1. Copy env file:
+1. Preferred: use the root `.env` (single-file setup for frontend + backend), and include:
+
+```bash
+ROBOFLOW_API_KEY=your_key_here
+ELEVENLABS_KEY=your_elevenlabs_key
+PORT=8787
+```
+
+Alternative local-only override:
 
 ```bash
 cp backend/.env.example backend/.env
 ```
 
-2. Edit `backend/.env` and set:
-
-```bash
-ROBOFLOW_API_KEY=your_key_here
-```
-
-3. Start API server:
+2. Start API server:
 
 ```bash
 npm run start:api
@@ -24,7 +26,7 @@ npm run start:api
 
 Server runs on `http://localhost:8787` by default.
 
-## Endpoint
+## Endpoints
 
 ### `POST /detect`
 
@@ -43,6 +45,14 @@ Returns Roboflow prediction JSON:
   "raw": {}
 }
 ```
+
+### `POST /transcribe`
+
+Accepts `multipart/form-data` with audio field `file`. Returns transcript JSON.
+
+### `POST /tts`
+
+Accepts JSON `{ "text": "..." }`. Returns `audio/mpeg`.
 
 ## Example frontend fetch (base64 JSON)
 

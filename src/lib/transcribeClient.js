@@ -1,7 +1,13 @@
 /**
  * Forwards recorded audio to the Express backend, which calls ElevenLabs STT.
- * Set REACT_APP_BACKEND_URL (e.g. http://localhost:8787) in .env for local dev.
+ * If REACT_APP_BACKEND_URL is unset, same-origin /api is used (Vercel single-app mode).
  */
+function getBackendBase() {
+  const raw = (process.env.REACT_APP_BACKEND_URL || '').trim().replace(/\/$/, '');
+  if (raw) return raw;
+  return '/api';
+}
+
 function stringifyTranscribeError(err) {
   if (err == null) return '';
   if (typeof err === 'string') return err;
@@ -48,7 +54,7 @@ export async function speakAloud(text, options = {}) {
   const trimmed = String(text || '').trim().slice(0, 2500);
   if (!trimmed) return { ok: true };
 
-  const base = (process.env.REACT_APP_BACKEND_URL || '').replace(/\/$/, '');
+  const base = getBackendBase();
   const tryWeb = async () => {
     if (!webSpeechFallback) return { ok: false, error: 'ElevenLabs unavailable and speech fallback disabled' };
     try {
@@ -136,12 +142,7 @@ export async function speakTextWithElevenLabs(text) {
 }
 
 export async function transcribeAudioBlob(blob, filename = 'recording.webm') {
-  const base = (process.env.REACT_APP_BACKEND_URL || '').replace(/\/$/, '');
-  if (!base) {
-    throw new Error(
-      'Missing REACT_APP_BACKEND_URL. Set it to your API origin (same host as backend/server.js), e.g. http://localhost:8787',
-    );
-  }
+  const base = getBackendBase();
   const fd = new FormData();
   fd.append('file', blob, filename);
   const res = await fetch(`${base}/transcribe`, { method: 'POST', body: fd });

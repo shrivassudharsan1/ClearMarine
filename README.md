@@ -104,27 +104,18 @@ npm install
 cp .env.example .env
 ```
 
-Create two env files:
-
-```bash
-cp .env.example .env
-cp backend/.env.example backend/.env
-```
-
-Fill in required values:
+Fill in required values (single env file for both frontend + backend):
 
 ```env
-# root .env
 REACT_APP_SUPABASE_URL=https://your-project.supabase.co
 REACT_APP_SUPABASE_ANON_KEY=your-anon-key
 REACT_APP_GEMINI_API_KEY=your-gemini-key
-REACT_APP_BACKEND_URL=http://localhost:8787
+# Leave unset for single-app Vercel deploys (frontend will call same-origin /api)
+# REACT_APP_BACKEND_URL=http://localhost:8787
 REACT_APP_MAINTENANCE_SCALE=0.05   # 0.05 = 20x shorter timers for demos
 
-# backend/.env
 PORT=8787
 ELEVENLABS_KEY=your-elevenlabs-key
-# Optional backend values:
 # ELEVENLABS_STT_MODEL=scribe_v2
 # ELEVENLABS_STT_LANGUAGE=en
 # ELEVENLABS_VOICE_ID=21m00TcmT4DvrzdWaoCl6
@@ -133,16 +124,23 @@ ELEVENLABS_KEY=your-elevenlabs-key
 ```
 
 Required keys summary:
-- Root (`.env`): `REACT_APP_SUPABASE_URL`, `REACT_APP_SUPABASE_ANON_KEY`, `REACT_APP_GEMINI_API_KEY`, `REACT_APP_BACKEND_URL`
-- Backend (`backend/.env`): `ELEVENLABS_KEY` (and `PORT` if you do not want default `8787`)
+- Root (`.env`): `REACT_APP_SUPABASE_URL`, `REACT_APP_SUPABASE_ANON_KEY`, `REACT_APP_GEMINI_API_KEY`, `ELEVENLABS_KEY`
+- Optional root (`.env`): `REACT_APP_BACKEND_URL` (only for split frontend/backend hosting), `PORT`, `ROBOFLOW_API_KEY`, and ElevenLabs model overrides
 
-### 4. (Optional) Seed HYCOM ocean currents
+### 4. Deploy on Vercel (single app)
+
+- Keep frontend + backend in one project.
+- Backend routes are exposed under `/api/*` via Vercel Functions (`api/[...path].js`).
+- Add the same env keys from `.env` to Vercel Project Settings → Environment Variables.
+- Do not upload `.env` files; Vercel reads env vars from project settings.
+
+### 5. (Optional) Seed HYCOM ocean currents
 
 ```bash
 node scripts/seed_currents.js
 ```
 
-### 5. Run
+### 6. Run
 
 ```bash
 npm start
