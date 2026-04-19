@@ -141,6 +141,8 @@ export default function Dashboard() {
   const [orderBanner, setOrderBanner] = useState(null);
   const [pendingHandoffs, setPendingHandoffs] = useState([]);
   const [aiSuggestions, setAiSuggestions] = useState([]);
+  const [newAssignToast, setNewAssignToast] = useState(null);
+  const toastTimerRef = useRef(null);
   const [aiLoading, setAiLoading] = useState(false);
   const [executingAction, setExecutingAction] = useState(null);
   const [assignModal, setAssignModal] = useState(null);
@@ -188,7 +190,9 @@ export default function Dashboard() {
       supabase.from('supply_orders').select('*').eq('status', 'in_transit').order('expected_arrival_at'),
     ]);
     if (sRes.data) {
-      const active = sRes.data.filter((s) => s.handoff_status !== 'pending');
+      const active = sRes.data.filter((s) =>
+        s.handoff_status !== 'pending' && s.jurisdiction === myAgencyRef.current,
+      );
       const incoming = sRes.data.filter((s) => (
         s.handoff_status === 'pending'
         && s.jurisdiction === myAgencyRef.current
@@ -299,6 +303,7 @@ export default function Dashboard() {
 
   useEffect(() => () => {
     if (aiRefreshTimerRef.current) clearTimeout(aiRefreshTimerRef.current);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
   }, []);
 
   const visibleSightings = useMemo(
@@ -458,7 +463,17 @@ export default function Dashboard() {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'vessels' }, () => {
         void fetchData().then(() => scheduleAiRefresh());
       })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'assignments' }, () => {
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'assignments' }, (payload) => {
+        if (payload.eventType === 'INSERT') {
+          const row = payload.new;
+          const vessel = vesselsDataRef.current.find((v) => v.id === row.vessel_id);
+          const sighting = sightingsDataRef.current.find((s) => s.id === row.sighting_id);
+          const crewName = vessel?.name || (row.crew_type === 'land' ? 'Shore crew' : 'Crew');
+          const debrisType = sighting?.debris_type?.replace('_', ' ') || 'debris';
+          setNewAssignToast({ crewName, debrisType });
+          if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+          toastTimerRef.current = setTimeout(() => setNewAssignToast(null), 6000);
+        }
         void fetchData().then(() => scheduleAiRefresh());
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'supplies' }, () => {
@@ -1008,7 +1023,7 @@ export default function Dashboard() {
               );
             })}
 
-            {vessels.filter((v) => v.current_lat && v.current_lon).map((v) => {
+            {vessels.filter((v) => v.current_lat && v.current_lon && v.agency === myAgency).map((v) => {
               const vesselMission = missionByVessel.get(v.id) || null;
               const vesselMissionColor = vesselMission?.color || null;
               const vesselMissionSelected = vesselMission && selectedMissionId === vesselMission.id;
@@ -1139,11 +1154,12 @@ export default function Dashboard() {
             {availableFleet.length === 0 && (
               <p className="mono text-[10px] mb-2 leading-snug" style={{ color: 'var(--amber)' }}>▲ No vessels available — free a hull to enable AI dispatch.</p>
             )}
-            {aiSuggestions.length === 0 ? (
+            {aiSuggestions.filter((s) => !s.dismissed).length === 0 ? (
               <p className="mono text-[10px]" style={{ color: 'var(--text-dim)' }}>Auto-refreshes after live updates. Hit REFRESH to force.</p>
             ) : (
               <div className="space-y-1.5">
                 {aiSuggestions.map((s, i) => {
+                  if (s.dismissed) return null;
                   const label = actionLabel(s.action_type);
                   return (
                     <div key={i} className="rounded-lg p-2 flex items-start gap-2"
@@ -1151,17 +1167,29 @@ export default function Dashboard() {
                         ? { background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.3)' }
                         : { background: 'var(--navy-surface)', border: '1px solid var(--navy-border)' }
                       }>
-                      <span className="mono text-[10px] shrink-0" style={{ color: 'var(--text-dim)' }}>{i + 1}.</span>
+                      <span className="mono text-[10px] shrink-0 mt-0.5" style={{ color: 'var(--text-dim)' }}>{i + 1}.</span>
                       <p className="text-xs flex-1 leading-snug" style={{ color: 'var(--text-primary)' }}>{s.text}</p>
                       {s.completed ? (
                         <span className="text-xs shrink-0" style={{ color: 'var(--green-ok)' }}>✓</span>
-                      ) : label ? (
-                        <button onClick={() => executeAction(s, i)} disabled={executingAction === i}
-                          className="shrink-0 mono text-[10px] font-bold px-2 py-0.5 rounded transition-colors whitespace-nowrap"
-                          style={{ background: 'rgba(0,212,255,0.12)', border: '1px solid var(--cyan-glow)', color: 'var(--cyan-glow)' }}>
-                          {executingAction === i ? '···' : label.toUpperCase()}
-                        </button>
-                      ) : null}
+                      ) : (
+                        <div className="flex items-center gap-1 shrink-0">
+                          {label && (
+                            <button onClick={() => executeAction(s, i)} disabled={executingAction === i}
+                              className="mono text-[10px] font-bold px-2 py-0.5 rounded transition-colors whitespace-nowrap"
+                              style={{ background: 'rgba(0,212,255,0.12)', border: '1px solid var(--cyan-glow)', color: 'var(--cyan-glow)' }}>
+                              {executingAction === i ? '···' : label.toUpperCase()}
+                            </button>
+                          )}
+                          <button
+                            onClick={() => setAiSuggestions((prev) => prev.map((x, j) => j === i ? { ...x, dismissed: true } : x))}
+                            className="mono text-[10px] font-bold w-5 h-5 flex items-center justify-center rounded transition-colors"
+                            style={{ color: 'var(--text-dim)', background: 'transparent' }}
+                            title="Dismiss"
+                            onMouseEnter={e => e.currentTarget.style.color = 'var(--red-crit)'}
+                            onMouseLeave={e => e.currentTarget.style.color = 'var(--text-dim)'}
+                          >✕</button>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -1388,7 +1416,7 @@ export default function Dashboard() {
               );
             })}
 
-            {activeTab === 'vessels' && vessels.map((v) => (
+            {activeTab === 'vessels' && vessels.filter((v) => v.agency === myAgency).map((v) => (
               <a key={v.id} href={`/vessel/${v.id}`} className="block rounded-xl p-3 transition-all" style={{ background: 'var(--navy-surface)', border: '1px solid var(--navy-border)' }}
                 onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--cyan-glow)'}
                 onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--navy-border)'}
@@ -1622,6 +1650,22 @@ export default function Dashboard() {
             </div>
             <button onClick={() => setBriefModal(null)} className="w-full mono font-bold py-2.5 rounded-xl transition-colors"
               style={{ background: 'rgba(0,212,255,0.12)', border: '1px solid var(--cyan-glow)', color: 'var(--cyan-glow)' }}>DONE</button>
+          </div>
+        </div>
+      )}
+
+      {/* New Assignment Toast */}
+      {newAssignToast && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[9999] slide-up pointer-events-none"
+          style={{ minWidth: 280 }}>
+          <div className="glass rounded-xl px-4 py-3 flex items-center gap-3" style={{ border: '1px solid var(--green-ok)', boxShadow: '0 0 24px rgba(16,185,129,0.3)' }}>
+            <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: 'var(--green-ok)', boxShadow: '0 0 8px var(--green-ok)' }} />
+            <div>
+              <p className="mono text-xs font-bold tracking-widest" style={{ color: 'var(--green-ok)' }}>NEW ASSIGNMENT DISPATCHED</p>
+              <p className="mono text-[10px] mt-0.5" style={{ color: 'var(--text-secondary)' }}>
+                {newAssignToast.crewName} → {newAssignToast.debrisType}
+              </p>
+            </div>
           </div>
         </div>
       )}

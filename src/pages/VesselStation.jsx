@@ -81,10 +81,16 @@ export default function VesselStation() {
 
   const markIntercepted = async () => {
     if (!assignment) return;
-    await Promise.all([
+    const updates = [
       supabase.from('assignments').update({ status: 'completed' }).eq('id', assignment.id),
       supabase.from('debris_sightings').update({ status: 'intercepted' }).eq('id', assignment.sighting_id),
-    ]);
+    ];
+    if (assignment.vessel_id) {
+      updates.push(
+        supabase.from('vessels').update({ status: 'available', updated_at: new Date().toISOString() }).eq('id', assignment.vessel_id),
+      );
+    }
+    await Promise.all(updates);
     fetchAssignment();
   };
 
