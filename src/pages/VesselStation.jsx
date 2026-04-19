@@ -7,7 +7,6 @@ import { formatEtaShort } from '../lib/cleanupTime';
 import {
   insertSupplyOrder,
   computeReorderQuantity,
-  formatEtaHuman,
   formatCountdownTo,
   applyDeliveredSupplyOrders,
 } from '../lib/supplyOrders';
