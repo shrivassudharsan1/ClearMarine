@@ -21,7 +21,7 @@ ClearMarine connects three groups in a single web app:
 ## Key Features
 
 ### Reporting (`/report`)
-- Snap a photo or describe debris in text — **Groq vision AI** returns type, density (1–10), and estimated volume
+- Snap a photo or describe debris in text — **Gemini AI** returns type, density (1–10), and estimated volume
 - GPS auto-detected or manually entered; drift forecast computed on submit
 - Voice report support with transcription
 - Done screen shows drift path, pickup mode badge, and predicted landfall
@@ -30,7 +30,7 @@ ClearMarine connects three groups in a single web app:
 - **Leaflet map** with live vessel positions, animated mission paths, and shore crew markers coast-to-coast
 - **Drift paths** clipped at modeled coastline — ⚑ flag only when track approaches shore
 - **Pickup classification** — debris within 15 km of shore routes to land crews automatically; deep-ocean sightings go to ships; drift-to-coast routes to shore crews. Land sightings suppress the drift heatmap entirely.
-- **AI Crew Agent** — Groq-powered suggestions: named vessel or shore crew, supply reorders, handoffs. Suggestions are dismissible
+- **AI Crew Agent** — Gemini-powered suggestions: named vessel or shore crew, supply reorders, handoffs. Suggestions are dismissible
 - Dispatch modal ranks all available crews by ETA (ship or land depending on pickup mode)
 - Per-agency isolation — each agency sees only their sightings and fleet; shore crews are shared
 - New sighting and assignment toast notifications at top of screen
@@ -54,7 +54,7 @@ ClearMarine connects three groups in a single web app:
 Public Reporter (/report)
     │  photo + GPS
     ▼
-Groq vision → debris_sightings (Supabase)
+Gemini analysis → debris_sightings (Supabase)
     │
     ▼
 predictDrift() → drift_predictions
@@ -66,8 +66,8 @@ predictDrift() → drift_predictions
 Dashboard (/dashboard) ← Supabase Realtime
     ├── classifyPickupMode() → land / ship / ship_coast / unknown
     ├── rankCrewsForSighting() → sorted ETA list
-    ├── AI Crew Agent (Groq) → assign / handoff / reorder suggestions
-    └── Assign → interception point + Groq crew brief → /vessel/:id
+    ├── AI Crew Agent (Gemini) → assign / handoff / reorder suggestions
+    └── Assign → interception point + Gemini crew brief → /vessel/:id
 ```
 
 ---
@@ -76,7 +76,7 @@ Dashboard (/dashboard) ← Supabase Realtime
 
 - **React 18** + **Tailwind CSS** (naval dark theme, glassmorphism)
 - **Supabase** (Postgres + Realtime subscriptions)
-- **Groq** (`llama-3.1-8b-instant`) for all AI: vision, text, crew suggestions, briefs
+- **Google Gemini** (`gemini-2.5-flash` by default) for AI text analysis, crew suggestions, and briefs
 - **Leaflet** + `react-leaflet` for maps
 - **Spray CORC glider data** (`public/data/corc_glider_index.json`) for real ocean current drift
 
@@ -104,14 +104,37 @@ npm install
 cp .env.example .env
 ```
 
-Fill in:
+Create two env files:
+
+```bash
+cp .env.example .env
+cp backend/.env.example backend/.env
+```
+
+Fill in required values:
 
 ```env
+# root .env
 REACT_APP_SUPABASE_URL=https://your-project.supabase.co
 REACT_APP_SUPABASE_ANON_KEY=your-anon-key
-REACT_APP_GROQ_API_KEY=your-groq-key
+REACT_APP_GEMINI_API_KEY=your-gemini-key
+REACT_APP_BACKEND_URL=http://localhost:8787
 REACT_APP_MAINTENANCE_SCALE=0.05   # 0.05 = 20x shorter timers for demos
+
+# backend/.env
+PORT=8787
+ELEVENLABS_KEY=your-elevenlabs-key
+# Optional backend values:
+# ELEVENLABS_STT_MODEL=scribe_v2
+# ELEVENLABS_STT_LANGUAGE=en
+# ELEVENLABS_VOICE_ID=21m00TcmT4DvrzdWaoCl6
+# ELEVENLABS_TTS_MODEL=eleven_multilingual_v2
+# ROBOFLOW_API_KEY=your-roboflow-key
 ```
+
+Required keys summary:
+- Root (`.env`): `REACT_APP_SUPABASE_URL`, `REACT_APP_SUPABASE_ANON_KEY`, `REACT_APP_GEMINI_API_KEY`, `REACT_APP_BACKEND_URL`
+- Backend (`backend/.env`): `ELEVENLABS_KEY` (and `PORT` if you do not want default `8787`)
 
 ### 4. (Optional) Seed HYCOM ocean currents
 
@@ -131,7 +154,7 @@ npm start
 
 1. **`/report`** — submit a photo or typed sighting near a coastline. AI fills in debris type, density, and volume. Done screen shows drift path and pickup badge (Land crew / Ship pickup).
 2. **`/dashboard`** — sighting appears live on the map. AI Crew Agent suggests a vessel or shore crew. Click **DISPATCH CREW** → modal ranks all available crews by ETA.
-3. Assign the top crew → brief modal with intercept coordinates and Groq-generated crew brief.
+3. Assign the top crew → brief modal with intercept coordinates and Gemini-generated crew brief.
 4. **`/vessel/:id`** — crew view shows the assignment. Hit **MARK INTERCEPTED** → vessel returns to available, mission closes on dashboard.
 5. Show the **CREWS tab** — full roster of 24 shore crews coast-to-coast, all with live status badges.
 6. *(Bonus)* Switch agency selector to **EPA** — dashboard shows only EPA sightings and handles incoming handoffs from ClearMarine Operations.
