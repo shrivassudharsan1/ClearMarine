@@ -1,12 +1,14 @@
 /**
- * Optional Roboflow detection.
+ * Optional Roboflow detection (implemented for later; off by default).
  *
- * Preferred (secure): call the local backend proxy so the API key never reaches the browser:
- * - set REACT_APP_ROBOFLOW_PROXY_URL (e.g. http://localhost:8787)
+ * Enable when ready: REACT_APP_ENABLE_ROBOFLOW=1 plus proxy or direct Infer URLs — see root .env.example.
+ *
+ * Preferred (secure): local backend proxy so the API key never reaches the browser:
+ * - REACT_APP_ROBOFLOW_PROXY_URL (e.g. http://localhost:8787) + backend ROBOFLOW_API_KEY
  * - start backend: npm run start:api
  *
  * Legacy (not recommended): direct browser call to Roboflow Infer
- * - set REACT_APP_ROBOFLOW_DETECT_URL + REACT_APP_ROBOFLOW_API_KEY
+ * - REACT_APP_ROBOFLOW_DETECT_URL + REACT_APP_ROBOFLOW_API_KEY
  */
 
 import { MIN_CV_BOX_CONFIDENCE } from './cvConstants';
@@ -66,6 +68,9 @@ function normalizeRoboflowBbox(pred, imgW, imgH) {
  * }>}
  */
 export async function runRoboflowDetection(dataUrl) {
+  if (process.env.REACT_APP_ENABLE_ROBOFLOW !== '1') {
+    return null;
+  }
   const proxyBase = (process.env.REACT_APP_ROBOFLOW_PROXY_URL || '').trim().replace(/\/$/, '');
   const directBase = (process.env.REACT_APP_ROBOFLOW_DETECT_URL || '').trim().replace(/\/$/, '');
   const apiKey = (process.env.REACT_APP_ROBOFLOW_API_KEY || '').trim();

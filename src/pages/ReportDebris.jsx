@@ -2,47 +2,20 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import {
   analyzeDebrisPhoto,
   analyzeDebrisText,
+  inferVoiceReportFieldsFromTranscript,
   notesLookSufficient,
   structuredReportComplete,
 } from '../lib/gemini';
 import { supabase } from '../lib/supabase';
 import { predictDrift } from '../lib/drift';
 import { formatCoordPair, parseManualLongitudeWest } from '../lib/coords';
-
-const WASTE_TYPE_OPTIONS = [
-  { value: 'plastic', label: 'Plastic / foam / bottles' },
-  { value: 'fishing_gear', label: 'Fishing gear / nets / rope' },
-  { value: 'organic', label: 'Organic / wood / vegetation' },
-  { value: 'chemical', label: 'Oil / chemical / hazardous sheen' },
-  { value: 'mixed', label: 'Mixed types' },
-  { value: 'unknown', label: 'Not sure' },
-];
-
-const SIZE_OPTIONS = [
-  { value: 'Single item (hand-sized or smaller)', label: 'One small item (hand-sized or smaller)' },
-  { value: 'Single large item (bucket to tire-sized)', label: 'One large item (bucket to tire-sized)' },
-  { value: 'Pile — fills a shopping bag', label: 'Pile — about a shopping bag' },
-  { value: 'Pile — wheelbarrow or larger', label: 'Pile — wheelbarrow-sized or larger' },
-  { value: 'Linear debris — a few meters', label: 'Stretched along shore/water — a few meters' },
-  { value: 'Linear debris — tens of meters or more', label: 'Line or slick — tens of meters or more' },
-  { value: 'Widespread field / patch', label: 'Widespread patch or field of debris' },
-];
-
-const QUANTITY_OPTIONS = [
-  { value: '1', label: '1 piece' },
-  { value: '2–10', label: '2–10 pieces' },
-  { value: '10–100', label: '10–100 pieces' },
-  { value: '100+', label: 'More than 100 pieces' },
-  { value: 'Continuous line or slick', label: 'Continuous line or slick (no clear count)' },
-];
-
-const SPREAD_OPTIONS = [
-  { value: '', label: 'Not sure / skip' },
-  { value: 'concentrated', label: 'Mostly one spot' },
-  { value: 'scattered', label: 'Scattered pieces' },
-  { value: 'linear_along_shore', label: 'Along a shoreline or track' },
-  { value: 'widespread_patch', label: 'Spread over a wide area' },
-];
+import { transcribeAudioBlob, speakAloud, speakWithWebSpeech } from '../lib/transcribeClient';
+import {
+  WASTE_TYPE_OPTIONS,
+  SIZE_OPTIONS,
+  QUANTITY_OPTIONS,
+  SPREAD_OPTIONS,
+} from '../constants/debrisReportFormOptions';
 
 export default function ReportDebris() {
   const [step, setStep] = useState('name'); // name | report | done
@@ -58,14 +31,35 @@ export default function ReportDebris() {
   const [locLoading, setLocLoading] = useState(false);
   const [locError, setLocError] = useState(null);
   const [result, setResult] = useState(null);
-  const [listening, setListening] = useState(false);
+  /** Voice capture: idle | recording | processing | speaking | error */
+  const [voicePhase, setVoicePhase] = useState('idle');
+  const [voiceError, setVoiceError] = useState('');
+  const [voiceTranscript, setVoiceTranscript] = useState('');
+  /** Last spoken / shown clarification from assistant (ElevenLabs TTS + Groq copy). */
+  const [voiceAssistantLine, setVoiceAssistantLine] = useState('');
+  /** When autoplay is blocked, play TTS after a tap (same object URL until played). */
+  const [ttsTapUrl, setTtsTapUrl] = useState(null);
+  /** Field keys Groq marked empty or low-confidence (for on-screen hint). */
+  const [voiceFieldsPending, setVoiceFieldsPending] = useState([]);
+  const photoRef = useRef(null);
+  const structuredRef = useRef({
+    waste_type: '',
+    size_category: '',
+    quantity_band: '',
+    spread_layout: '',
+  });
   const [notes, setNotes] = useState('');
   const [wasteType, setWasteType] = useState('');
   const [sizeCategory, setSizeCategory] = useState('');
   const [quantityBand, setQuantityBand] = useState('');
   const [spreadLayout, setSpreadLayout] = useState('');
   const fileRef = useRef(null);
-  const recognitionRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const mediaChunksRef = useRef([]);
+  const mediaStreamRef = useRef(null);
+  /** Increments on each successful transmit — completion TTS runs once per id (Strict Mode safe). */
+  const [reportSessionId, setReportSessionId] = useState(0);
+  const doneTtsSessionRef = useRef(-1);
 
   const retryLowAccuracy = useCallback(() => {
     if (!navigator.geolocation) {
@@ -130,6 +124,47 @@ export default function ReportDebris() {
     requestLocation();
   }, [step, locMode, requestLocation]);
 
+  useEffect(() => {
+    photoRef.current = photo;
+  }, [photo]);
+
+  useEffect(() => {
+    structuredRef.current = {
+      waste_type: wasteType,
+      size_category: sizeCategory,
+      quantity_band: quantityBand,
+      spread_layout: spreadLayout,
+    };
+  }, [wasteType, sizeCategory, quantityBand, spreadLayout]);
+
+  /** ElevenLabs TTS once per successful submit (done screen). */
+  useEffect(() => {
+    if (step !== 'done' || !result) return undefined;
+    if (doneTtsSessionRef.current === reportSessionId) return undefined;
+    doneTtsSessionRef.current = reportSessionId;
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const out = await speakAloud('Report completed. Sighting logged.', {
+          preferElevenLabs: true,
+          webSpeechFallback: true,
+        });
+        if (cancelled) return;
+        if (out && out.ok === false && out.needsTap && out.objectUrl) {
+          setTtsTapUrl(out.objectUrl);
+        }
+      } catch {
+        /* Missing REACT_APP_BACKEND_URL or TTS error — non-blocking */
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      doneTtsSessionRef.current = -1;
+    };
+  }, [step, result, reportSessionId]);
+
   const handlePhoto = (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -142,25 +177,171 @@ export default function ReportDebris() {
     reader.readAsDataURL(file);
   };
 
-  const startVoice = () => {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) { alert('Voice not supported — try Chrome.'); return; }
-    const rec = new SR();
-    rec.continuous = false;
-    rec.interimResults = true;
-    rec.lang = 'en-US';
-    rec.onstart = () => setListening(true);
-    rec.onend = () => setListening(false);
-    rec.onresult = (e) => {
-      const t = Array.from(e.results).map((r) => r[0].transcript).join('');
-      setNotes(t);
-    };
-    rec.onerror = () => setListening(false);
-    recognitionRef.current = rec;
-    rec.start();
-  };
+  const pickAudioMime = useCallback(() => {
+    const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
+    for (let i = 0; i < types.length; i += 1) {
+      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(types[i])) return types[i];
+    }
+    return '';
+  }, []);
 
-  const stopVoice = () => { recognitionRef.current?.stop(); setListening(false); };
+  const stopMediaTracks = useCallback(() => {
+    mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+    mediaStreamRef.current = null;
+  }, []);
+
+  const startVoiceRecording = useCallback(async () => {
+    setVoiceError('');
+    setTtsTapUrl(null);
+    setVoiceFieldsPending([]);
+    if (voicePhase === 'processing' || voicePhase === 'speaking') return;
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setVoiceError('Microphone capture is not supported in this browser.');
+      setVoicePhase('error');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+      mediaChunksRef.current = [];
+      const mime = pickAudioMime();
+      const mr = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+      mediaRecorderRef.current = mr;
+      mr.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) mediaChunksRef.current.push(ev.data);
+      };
+      mr.onerror = () => {
+        setVoiceError('Recording failed.');
+        setVoicePhase('error');
+        stopMediaTracks();
+      };
+      mr.onstop = async () => {
+        stopMediaTracks();
+        const blob = new Blob(mediaChunksRef.current, { type: mr.mimeType || 'audio/webm' });
+        mediaChunksRef.current = [];
+        if (!blob.size) {
+          setVoicePhase('idle');
+          return;
+        }
+        setVoicePhase('processing');
+        try {
+          const text = await transcribeAudioBlob(blob, 'recording.webm');
+          setVoiceTranscript(text);
+          setNotes((prev) => {
+            const base = (prev || '').trimEnd();
+            const block = `[Voice transcript — ElevenLabs STT]\n${text}`;
+            return base ? `${base}\n\n${block}` : block;
+          });
+
+          const hasPhoto = Boolean(photoRef.current);
+          const cur = structuredRef.current;
+          const inferred = await inferVoiceReportFieldsFromTranscript(text, {
+            hasPhoto,
+            current: {
+              waste_type: cur.waste_type,
+              size_category: cur.size_category,
+              quantity_band: cur.quantity_band,
+              spread_layout: cur.spread_layout,
+            },
+          });
+
+          if (inferred.infer_skipped !== 'parse_error') {
+            if (inferred.waste_type) setWasteType(inferred.waste_type);
+            if (inferred.infer_skipped !== 'no_groq') {
+              setSizeCategory(inferred.size_category ?? '');
+              setQuantityBand(inferred.quantity_band ?? '');
+              setSpreadLayout(inferred.spread_layout ?? '');
+            }
+          }
+
+          if (inferred.supplemental_notes) {
+            setNotes((prev) => {
+              const p = (prev || '').trimEnd();
+              const sn = inferred.supplemental_notes.trim();
+              if (!sn || p.includes(sn.slice(0, 48))) return prev;
+              const chunk = `[From voice]\n${sn}`;
+              return p ? `${p}\n\n${chunk}` : chunk;
+            });
+          }
+
+          if (inferred.infer_skipped === 'no_groq') {
+            setVoiceError(
+              'Voice cannot fill the sighting fields without Groq. Add REACT_APP_GROQ_API_KEY to the root .env, then stop and run npm start again.',
+            );
+          } else if (inferred.infer_skipped === 'parse_error') {
+            setVoiceError(
+              'Could not map voice to the form automatically. Try again with short clear phrases, or set type / size / amount manually.',
+            );
+          }
+
+          const fallbackAsk = 'Could you briefly say what kind of debris it is, how large it is, and about how many pieces or how wide the area is?';
+          const ask = inferred.infer_skipped === 'no_groq'
+            ? ''
+            : inferred.report_ready
+              ? ''
+              : (inferred.clarification_speech || fallbackAsk).trim();
+          setVoiceAssistantLine(ask);
+          setVoiceFieldsPending(
+            Array.isArray(inferred.fields_needing_clarification)
+              ? inferred.fields_needing_clarification
+              : [],
+          );
+
+          if (ask) {
+            setVoicePhase('speaking');
+            try {
+              const out = await speakAloud(ask, { preferElevenLabs: true, webSpeechFallback: true });
+              if (out && out.ok === false && out.needsTap && out.objectUrl) {
+                setTtsTapUrl(out.objectUrl);
+              }
+            } catch (speakErr) {
+              setVoiceError(String(speakErr?.message || speakErr || 'Voice playback failed'));
+            }
+          }
+          setVoicePhase('idle');
+        } catch (err) {
+          setVoiceError(err.message || 'Transcription failed');
+          setVoicePhase('error');
+        }
+      };
+      mr.start(250);
+      setVoicePhase('recording');
+    } catch (e) {
+      setVoiceError(e.message || 'Could not access microphone');
+      setVoicePhase('error');
+    }
+  }, [pickAudioMime, stopMediaTracks, voicePhase]);
+
+  const stopVoiceRecording = useCallback(() => {
+    const mr = mediaRecorderRef.current;
+    if (mr && mr.state === 'recording') {
+      mr.stop();
+      return;
+    }
+    if (voicePhase === 'recording') {
+      stopMediaTracks();
+      setVoicePhase('idle');
+    }
+  }, [stopMediaTracks, voicePhase]);
+
+  /** User gesture path: ElevenLabs when possible, else browser speech (autoplay is blocked after async submit). */
+  const playDoneConfirmation = useCallback(async () => {
+    try {
+      const out = await speakAloud('Report completed. Sighting logged.', {
+        preferElevenLabs: true,
+        webSpeechFallback: true,
+      });
+      if (out?.needsTap && out.objectUrl) setTtsTapUrl(out.objectUrl);
+    } catch (err) {
+      console.warn('[done-audio]', err);
+    }
+  }, []);
+
+  useEffect(() => () => {
+    const mr = mediaRecorderRef.current;
+    if (mr && mr.state === 'recording') mr.stop();
+    stopMediaTracks();
+  }, [stopMediaTracks]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -190,11 +371,13 @@ export default function ReportDebris() {
 
     setLoading(true);
     try {
-      let analysis = photo
-        ? await analyzeDebrisPhoto(photo.base64, photo.mimeType, lat, lon, notes, reporterStructured)
-        : await analyzeDebrisText(notes, lat, lon, reporterStructured);
+      const combinedNotesForHeuristic = `${notes}\n${voiceTranscript}`.trim();
 
-      if (photo && (notesLookSufficient(notes) || structuredReportComplete(reporterStructured))) {
+      let analysis = photo
+        ? await analyzeDebrisPhoto(photo.base64, photo.mimeType, lat, lon, notes, reporterStructured, voiceTranscript)
+        : await analyzeDebrisText(notes, lat, lon, reporterStructured, voiceTranscript);
+
+      if (photo && (notesLookSufficient(combinedNotesForHeuristic) || structuredReportComplete(reporterStructured))) {
         analysis = {
           ...analysis,
           needs_more_info: false,
@@ -226,9 +409,19 @@ export default function ReportDebris() {
         || (analysis.quantity_estimate && analysis.quantity_estimate !== 'unknown')
         ? `\n\nScale summary — size: ${analysis.approximate_size}; quantity: ${analysis.quantity_estimate}; spread: ${analysis.spread || 'unknown'}`
         : '';
+      const voiceBlock = voiceTranscript.trim()
+        ? `\n\n[Voice transcript — ElevenLabs STT]\n${voiceTranscript.trim()}`
+        : '';
+      const impactResponderBlock = [
+        analysis.impact_threat_score != null
+          && `Impact / threat (Groq): ${analysis.impact_threat_score}/10${analysis.impact_threat_label ? ` (${analysis.impact_threat_label})` : ''}${analysis.threat_rationale ? ` — ${analysis.threat_rationale}` : ''}`,
+        analysis.responder_report && `Responder brief:\n${analysis.responder_report}`,
+      ].filter(Boolean).join('\n\n');
+
       const geminiAnalysisStored = [
-        structuredSummary + analysis.gemini_analysis + scaleBlock + intensityBlock,
-        notes.trim() && `Reporter notes: ${notes.trim()}`,
+        structuredSummary + analysis.gemini_analysis + scaleBlock + intensityBlock + voiceBlock
+        + (impactResponderBlock ? `\n\n${impactResponderBlock}` : ''),
+        notes.trim() && `Reporter typed notes: ${notes.trim()}`,
       ].filter(Boolean).join('\n\n');
 
       const { data: sighting, error } = await supabase
@@ -265,6 +458,7 @@ export default function ReportDebris() {
       });
 
       setResult({ analysis, drift, lat, lon });
+      setReportSessionId((n) => n + 1);
       setStep('done');
     } catch (err) {
       console.error(err);
@@ -330,6 +524,24 @@ export default function ReportDebris() {
             <div className="text-4xl mb-3">✦</div>
             <h2 className="display text-3xl tracking-widest" style={{ color: 'var(--green-ok)' }}>SIGHTING LOGGED</h2>
             <p className="mono text-xs mt-1 tracking-widest" style={{ color: 'var(--text-secondary)' }}>FIELD REPORT TRANSMITTED TO COMMAND</p>
+            <div className="mt-4 flex flex-col gap-2">
+              <button
+                type="button"
+                onClick={() => void playDoneConfirmation()}
+                className="mono text-[10px] px-3 py-2.5 rounded-lg tracking-widest w-full"
+                style={{ background: 'rgba(0,212,255,0.12)', border: '1px solid var(--cyan-glow)', color: 'var(--cyan-glow)' }}
+              >
+                HEAR CONFIRMATION (tap — ElevenLabs or device voice)
+              </button>
+              <button
+                type="button"
+                onClick={() => void speakWithWebSpeech('Report completed. Sighting logged.')}
+                className="mono text-[10px] px-3 py-2 rounded-lg tracking-widest w-full"
+                style={{ background: 'var(--navy-deep)', border: '1px solid var(--navy-border)', color: 'var(--text-secondary)' }}
+              >
+                DEVICE VOICE ONLY (no server)
+              </button>
+            </div>
           </div>
 
           <div className="rounded-xl p-4 mb-4 space-y-3" style={{ background: 'var(--navy-surface)', border: '1px solid var(--navy-border)' }}>
@@ -357,6 +569,26 @@ export default function ReportDebris() {
               <p className="text-xs italic leading-snug pl-2" style={{ borderLeft: '2px solid var(--cyan-glow)', color: 'var(--text-secondary)' }}>
                 {result.analysis.intensity_rationale}
               </p>
+            )}
+            {result.analysis.impact_threat_score != null && (
+              <div className="rounded-lg p-3 space-y-1" style={{ background: 'rgba(0,212,255,0.06)', border: '1px solid rgba(0,212,255,0.25)' }}>
+                <p className="mono text-[10px] tracking-widest" style={{ color: 'var(--cyan-glow)' }}>IMPACT / THREAT (GROQ · CORC + VOICE + FIELDS)</p>
+                <p className="mono text-sm" style={{ color: 'var(--text-primary)' }}>
+                  {result.analysis.impact_threat_score}/10
+                  {result.analysis.impact_threat_label ? (
+                    <span className="text-xs ml-2" style={{ color: 'var(--text-secondary)' }}>{result.analysis.impact_threat_label}</span>
+                  ) : null}
+                </p>
+                {result.analysis.threat_rationale && (
+                  <p className="text-xs leading-snug" style={{ color: 'var(--text-secondary)' }}>{result.analysis.threat_rationale}</p>
+                )}
+              </div>
+            )}
+            {result.analysis.responder_report && (
+              <div className="rounded-lg p-3" style={{ background: 'var(--navy-deep)', border: '1px solid var(--navy-border)' }}>
+                <p className="mono text-[10px] tracking-widest mb-1" style={{ color: 'var(--green-ok)' }}>RESPONDER BRIEF (GROQ)</p>
+                <p className="text-sm leading-relaxed" style={{ color: 'var(--text-primary)' }}>{result.analysis.responder_report}</p>
+              </div>
             )}
             {result.analysis.severity_assessment && (
               <div className="rounded-lg p-3 space-y-2" style={{ background: 'var(--navy-deep)', border: '1px solid rgba(0,212,255,0.2)' }}>
@@ -440,12 +672,47 @@ export default function ReportDebris() {
             </p>
           </div>
 
+          {ttsTapUrl && (
+            <div className="mb-3">
+              <button
+                type="button"
+                className="mono text-[10px] px-3 py-2 rounded-lg w-full tracking-widest"
+                style={{ background: 'rgba(0,212,255,0.12)', border: '1px solid var(--cyan-glow)', color: 'var(--cyan-glow)' }}
+                onClick={() => {
+                  const u = ttsTapUrl;
+                  if (!u) return;
+                  const a = new Audio(u);
+                  a.playsInline = true;
+                  if (a.setAttribute) a.setAttribute('playsinline', 'true');
+                  void a.play()
+                    .then(() => {
+                      a.onended = () => {
+                        URL.revokeObjectURL(u);
+                        setTtsTapUrl(null);
+                      };
+                    })
+                    .catch((err) => {
+                      console.warn(err);
+                    });
+                }}
+              >
+                TAP TO HEAR: REPORT COMPLETED
+              </button>
+            </div>
+          )}
+
           <button
             onClick={() => {
               setStep('name');
               setName('');
               setPhoto(null);
               setNotes('');
+              setVoiceTranscript('');
+              setVoicePhase('idle');
+              setVoiceError('');
+              setVoiceAssistantLine('');
+              setTtsTapUrl(null);
+              setVoiceFieldsPending([]);
               setWasteType('');
               setSizeCategory('');
               setQuantityBand('');
@@ -547,7 +814,7 @@ export default function ReportDebris() {
         <div className="glass rounded-2xl p-4 space-y-3">
           <p className="mono text-xs font-bold tracking-widest" style={{ color: 'var(--text-secondary)' }}>SIGHTING DETAILS</p>
           <p className="mono text-[10px] leading-snug" style={{ color: 'var(--text-dim)' }}>
-            These fields drive AI assessment · required without photo
+            These fields drive AI assessment · required without photo · speak with VOICE below to auto-fill best-match options
           </p>
           {[
             { label: 'TYPE OF WASTE', value: wasteType, setter: setWasteType, opts: WASTE_TYPE_OPTIONS, placeholder: 'Select…' },
@@ -656,13 +923,28 @@ export default function ReportDebris() {
             </p>
             <button
               type="button"
-              onClick={listening ? stopVoice : startVoice}
-              className="mono flex items-center gap-1.5 text-[10px] px-3 py-1.5 rounded-lg transition-colors tracking-widest"
-              style={listening
+              aria-label={
+                voicePhase === 'recording'
+                  ? 'Stop voice recording'
+                  : voicePhase === 'processing'
+                    ? 'Processing voice'
+                    : voicePhase === 'speaking'
+                      ? 'Assistant speaking'
+                      : 'Start voice recording'
+              }
+              disabled={voicePhase === 'processing' || voicePhase === 'speaking'}
+              onClick={() => {
+                if (voicePhase === 'recording') stopVoiceRecording();
+                else if (voicePhase !== 'processing' && voicePhase !== 'speaking') void startVoiceRecording();
+              }}
+              className="mono flex items-center gap-1.5 text-[10px] px-3 py-1.5 rounded-lg transition-colors tracking-widest disabled:opacity-40"
+              style={voicePhase === 'recording'
                 ? { background: 'rgba(239,68,68,0.15)', border: '1px solid var(--red-crit)', color: 'var(--red-crit)' }
-                : { background: 'var(--navy-surface)', border: '1px solid var(--navy-border)', color: 'var(--text-secondary)' }}
+                : voicePhase === 'processing' || voicePhase === 'speaking'
+                  ? { background: 'rgba(0,212,255,0.08)', border: '1px solid var(--cyan-glow)', color: 'var(--cyan-glow)' }
+                  : { background: 'var(--navy-surface)', border: '1px solid var(--navy-border)', color: 'var(--text-secondary)' }}
             >
-              🎤 {listening ? 'STOP' : 'VOICE'}
+              🎤 {voicePhase === 'recording' ? 'STOP' : voicePhase === 'processing' ? 'PROCESSING' : voicePhase === 'speaking' ? 'SPEAKING' : 'VOICE'}
             </button>
           </div>
           <textarea
@@ -675,7 +957,64 @@ export default function ReportDebris() {
             onFocus={e => e.target.style.borderColor = 'var(--cyan-glow)'}
             onBlur={e => e.target.style.borderColor = 'var(--navy-border)'}
           />
-          {listening && <p className="mono text-[10px] mt-1 glow-pulse" style={{ color: 'var(--red-crit)' }}>● LISTENING…</p>}
+          {voicePhase === 'recording' && (
+            <p className="mono text-[10px] mt-1 glow-pulse" style={{ color: 'var(--red-crit)' }}>● RECORDING…</p>
+          )}
+          {voicePhase === 'processing' && (
+            <p className="mono text-[10px] mt-1" style={{ color: 'var(--cyan-glow)' }}>● TRANSCRIBING · FIELD MAP (ElevenLabs + Groq)…</p>
+          )}
+          {voicePhase === 'speaking' && (
+            <p className="mono text-[10px] mt-1 glow-pulse" style={{ color: 'var(--cyan-glow)' }}>● ASSISTANT (ElevenLabs TTS)…</p>
+          )}
+          {voiceAssistantLine && voicePhase === 'idle' && (
+            <p className="mono text-[10px] mt-2 leading-snug rounded-lg p-2" style={{ background: 'var(--navy-deep)', border: '1px solid var(--navy-border)', color: 'var(--text-secondary)' }}>
+              <span style={{ color: 'var(--text-dim)' }}>Last prompt · </span>
+              {voiceAssistantLine}
+            </p>
+          )}
+          {voiceFieldsPending.length > 0 && voicePhase === 'idle' && (
+            <p className="mono text-[10px] mt-1" style={{ color: 'var(--text-dim)' }}>
+              Open items: {voiceFieldsPending.join(', ').replace(/_/g, ' ')}
+            </p>
+          )}
+          {ttsTapUrl && (
+            <div className="mt-2">
+              <button
+                type="button"
+                className="mono text-[10px] px-3 py-2 rounded-lg w-full tracking-widest"
+                style={{ background: 'rgba(0,212,255,0.12)', border: '1px solid var(--cyan-glow)', color: 'var(--cyan-glow)' }}
+                onClick={() => {
+                  const u = ttsTapUrl;
+                  if (!u) return;
+                  const a = new Audio(u);
+                  a.play()
+                    .then(() => {
+                      a.onended = () => {
+                        URL.revokeObjectURL(u);
+                        setTtsTapUrl(null);
+                      };
+                    })
+                    .catch((err) => {
+                      setVoiceError(String(err?.message || err || 'Playback failed'));
+                    });
+                }}
+              >
+                TAP TO PLAY CLARIFICATION (BROWSER BLOCKED AUTOPLAY)
+              </button>
+            </div>
+          )}
+          {voicePhase === 'error' && voiceError && (
+            <div className="mt-2 rounded-lg p-2 text-[10px] mono" style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid var(--red-crit)', color: 'var(--red-crit)' }}>
+              <p>{voiceError}</p>
+              <button
+                type="button"
+                className="mt-1 underline"
+                onClick={() => { setVoiceError(''); setVoicePhase('idle'); }}
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
         </div>
 
         <button

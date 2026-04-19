@@ -1,8 +1,18 @@
+/**
+ * Debris + ops LLM helpers. Current stack: Groq only in-process (ElevenLabs STT lives on the backend).
+ * @google/generative-ai stays in package.json for a future Gemini vision / extra pass — not imported here yet.
+ */
 import Groq from 'groq-sdk';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { runMarineDebrisPipeline } from './debrisPipeline';
 import { applyLlmFirstSignalFusion } from './reconcileSignals';
 import { numericConfidenceToCategory, scoreToDensityLabel } from './severityUtils';
+import { getNearestGliderCurrent } from './gliderCurrents';
+import {
+  WASTE_TYPE_VALUES,
+  SIZE_VALUES,
+  QUANTITY_VALUES,
+  SPREAD_VALUES,
+} from '../constants/debrisReportFormOptions';
 
 export function structuredReportComplete(s) {
   if (!s || typeof s !== 'object') return false;
@@ -22,6 +32,21 @@ function formatReporterStructuredBlock(s) {
   if (s.extra_notes) lines.push(`Extra reporter notes: ${s.extra_notes}`);
   if (lines.length === 0) return '';
   return `Structured reporter input (form selections — reconcile with CV and any VISION_PRIOR; not ground truth for species or scale if the photo contradicts them):\n${lines.join('\n')}\n`;
+}
+
+/** ElevenLabs STT verbatim slice for Groq prompts (same transcript also merged into impact JSON). */
+function formatVoiceTranscriptForPrompt(voiceTranscript) {
+  const v = String(voiceTranscript || '').trim().replace(/\s+/g, ' ');
+  if (!v) return '';
+  const safe = v.replace(/"/g, "'").slice(0, 4000);
+  return `
+────────────────────────────
+VOICE_TRANSCRIPT (ElevenLabs speech-to-text — verbatim)
+────────────────────────────
+"${safe}"
+
+Treat this as first-class evidence alongside structured fields and typed notes: hazards, wildlife, sheen/smell, timing, landmarks, or quantities may appear only here.
+`;
 }
 
 const groq = new Groq({
@@ -47,16 +72,44 @@ function textModelFallbackChain() {
   return [primary, ...rest].filter((m, i, a) => m && a.indexOf(m) === i);
 }
 
-async function groqTextCompletion(messages) {
-  const chain = textModelFallbackChain();
+/** Stronger default chain for voice → form mapping only. Override: REACT_APP_GROQ_VOICE_INFER_MODEL */
+function voiceInferModelFallbackChain() {
+  const primary = process.env.REACT_APP_GROQ_VOICE_INFER_MODEL || TEXT_FALLBACK_70B;
+  const rest =
+    primary.includes('70b') || primary.includes('gpt-oss')
+      ? [TEXT_FALLBACK_8B, TEXT_FALLBACK_GPT_OSS]
+      : [TEXT_FALLBACK_70B, TEXT_FALLBACK_8B, TEXT_FALLBACK_GPT_OSS];
+  return [primary, ...rest].filter((m, i, a) => m && a.indexOf(m) === i);
+}
+
+async function groqTextCompletion(messages, options = {}) {
+  const { responseFormatJson, modelChain } = options;
+  const chain = Array.isArray(modelChain) && modelChain.length ? modelChain : textModelFallbackChain();
   let lastErr;
   for (let i = 0; i < chain.length; i += 1) {
     const model = chain[i];
+    const baseParams = { model, messages };
+    const tryCreate = async (withJson) => {
+      const params = { ...baseParams };
+      if (withJson && responseFormatJson) {
+        params.response_format = { type: 'json_object' };
+      }
+      return groq.chat.completions.create(params);
+    };
     try {
-      return await groq.chat.completions.create({
-        model,
-        messages,
-      });
+      if (responseFormatJson) {
+        try {
+          return await tryCreate(true);
+        } catch (e) {
+          const status = e?.status;
+          const msg = String(e?.message || e?.error?.message || '');
+          if (status === 400 && /response_format|json/i.test(msg)) {
+            return await tryCreate(false);
+          }
+          throw e;
+        }
+      }
+      return await tryCreate(false);
     } catch (e) {
       lastErr = e;
       const code = e?.code || e?.error?.code;
@@ -74,11 +127,22 @@ async function groqTextCompletion(messages) {
   throw lastErr;
 }
 
+/** Strip ```json fences and parse first JSON object (Groq often wraps output). */
+function parseJSONObjectLoose(raw) {
+  let t = String(raw ?? '').trim();
+  const fence = /^```(?:json)?\s*\r?\n?([\s\S]*?)\r?\n?```\s*$/i.exec(t);
+  if (fence) t = fence[1].trim();
+  else if (t.startsWith('```')) {
+    t = t.replace(/^```[^\n]*\n?/, '').replace(/\n?```\s*$/, '').trim();
+  }
+  const start = t.indexOf('{');
+  const end = t.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) throw new Error('No JSON object found in model output');
+  return JSON.parse(t.slice(start, end + 1));
+}
+
 function extractJSON(text) {
-  const start = text.indexOf('{');
-  const end = text.lastIndexOf('}');
-  if (start === -1 || end === -1) throw new Error('No JSON found in response');
-  return JSON.parse(text.slice(start, end + 1));
+  return parseJSONObjectLoose(text);
 }
 
 function extractJSONArray(text) {
@@ -87,6 +151,414 @@ function extractJSONArray(text) {
   const end = t.lastIndexOf(']');
   if (start === -1 || end === -1 || end <= start) throw new Error('No JSON array found in response');
   return JSON.parse(t.slice(start, end + 1));
+}
+
+function pickAllowedFormValue(value, allowed) {
+  const s = String(value ?? '').trim();
+  if (!s) return '';
+  return allowed.includes(s) ? s : '';
+}
+
+function inferWasteTypeFromSpeechHint(raw) {
+  const s = String(raw ?? '').toLowerCase();
+  if (!s) return '';
+  if (/fish|net|rope|trap|pot|line|gear|lobster|crab/i.test(s)) return 'fishing_gear';
+  if (/oil|sheen|chemical|fuel|diesel|gasoline|slick/i.test(s)) return 'chemical';
+  if (/plastic|bottle|bag|foam|straw|cup|wrapper|micro/i.test(s)) return 'plastic';
+  if (/wood|kelp|seaweed|palm|leaf|organic/i.test(s)) return 'organic';
+  if (/mixed|several type|all kinds/i.test(s)) return 'mixed';
+  if (/not sure|unknown|unsure|idk/i.test(s)) return 'unknown';
+  return '';
+}
+
+function inferQuantityFromSpeechHint(raw) {
+  const s = String(raw ?? '').toLowerCase();
+  const full = String(raw ?? '');
+  if (!s) return '';
+  if (/\b(radius|circle|circular|round patch|ring of)\b/i.test(full) && !/\b(many|dozens|hundreds|\d+\s*(separate|different|distinct)|pieces everywhere|lots of pieces)\b/i.test(s)) {
+    return '1';
+  }
+  if (/continuous|slick|line along|band of|sheen/i.test(s)) return 'Continuous line or slick';
+  if (/100\s*\+|hundreds|200|300|thousands/i.test(s)) return '100+';
+  if (/dozen|10\s*[–-]?\s*100|twenty|thirty|fifty|many pieces/i.test(s)) return '10–100';
+  if (/^1\b|one piece|single piece|just one|a piece|one clump|single clump|one patch/i.test(s)) return '1';
+  if (/couple|few|several|some|handful|2\s*[–-]?\s*10\b|two pieces|three pieces|four pieces|five pieces|six pieces|seven pieces|eight pieces|nine pieces|ten pieces/i.test(s)) {
+    return '2–10';
+  }
+  if (/\btwo\b|\bfour\b|\bfive\b|\bsix\b|\bseven\b|\beight\b|\bnine\b|\bten\b/i.test(s) && /\bpieces\b|\bitems\b|\bbottles\b/i.test(s)) return '2–10';
+  return '';
+}
+
+function inferSizeFromSpeechHint(raw) {
+  const s = String(raw ?? '').toLowerCase();
+  const full = String(raw ?? '');
+  if (!s) return '';
+  if (/\b(radius|yard\s+radius|meter\s+radius|circle|circular|round\s+patch)\b/i.test(full)) {
+    if (/wheelbarrow|large circle|big patch|10\s*(yd|yard|m|meter)|wide\s+circle/i.test(s)) return 'Pile — wheelbarrow or larger';
+    if (/three[-\s]?yard|3[-\s]?yard|few yards|small circle|two[-\s]?yard/i.test(s)) return 'Pile — fills a shopping bag';
+    return 'Pile — fills a shopping bag';
+  }
+  if (/widespread|field|patch|everywhere|acres|hectares/i.test(s)) return 'Widespread field / patch';
+  if (/tens of meters|100\s*m|long line|kilometers|km of/i.test(s)) return 'Linear debris — tens of meters or more';
+  if (/\balong\s+(the\s+)?(shore|shoreline|water|beach|coast)\b|tide\s*line|stretched\s+along|linear\s+debris|line\s+of\s+debris/i.test(s)) {
+    return 'Linear debris — a few meters';
+  }
+  if (/wheelbarrow|truck|dumpster|pallet|huge pile/i.test(s)) return 'Pile — wheelbarrow or larger';
+  if (/shopping bag|bucket|armful|garbage bag/i.test(s)) return 'Pile — fills a shopping bag';
+  if (/tire|cooler|large item|furniture|drum|big one/i.test(s)) return 'Single large item (bucket to tire-sized)';
+  if (/hand|bottle|small|tiny|single small|glove|wrapper/i.test(s)) return 'Single item (hand-sized or smaller)';
+  return '';
+}
+
+/**
+ * Localized circular patch (yard/m radius) is NOT linear along shore; default one clump + spread unknown.
+ */
+function applyCircularPatchGeometryOverrides(transcript, o) {
+  const t = String(transcript || '');
+  const tl = t.toLowerCase();
+  const circle = /\b(radius|circle|circular|round\s+patch|ring\s+of)\b/i.test(t);
+  const alongShore = /\b(along\s+(the\s+)?(shore|shoreline|water|beach|coast)|tide\s*line|stretched\s+along\s+the|linear\s+along|beach\s+line)\b/i.test(tl);
+  if (!circle || alongShore) return o;
+
+  const out = { ...o };
+  out.spread_layout = '';
+  out.quantity_band = '1';
+  if (/wheelbarrow|large circle|10\s*(yd|yard|m|meter)|big patch|wide\s+circle/i.test(tl)) {
+    out.size_category = 'Pile — wheelbarrow or larger';
+  } else {
+    out.size_category = 'Pile — fills a shopping bag';
+  }
+  return out;
+}
+
+function transcriptRefusesToQuantify(transcript) {
+  const t = String(transcript || '').toLowerCase();
+  return /\b(don'?t quantify|do not quantify|don'?t count|do not count|don'?t estimate|no estimate|not quantif|can'?t quantify|won'?t quantify|hard to count|can'?t count|no count|don'?t want to count|skip (the )?count)\b/i.test(t);
+}
+
+function hasExplicitSizeLanguageInTranscript(transcript) {
+  const t = String(transcript || '');
+  return /\b(shopping bag|wheelbarrow|hand-sized|hand size|bucket|meter|metre|yard|yards|foot|feet|\d+\s*(m|meter|metres|yd|yard|yards|ft|foot|feet|cm|km)|\d+\s*x\s*\d+|pile|patch|radius|circle|linear|along\s+the|shoreline|tide\s*line|widespread|single large|tire-sized|cooler)\b/i.test(t);
+}
+
+function hasExplicitQuantityLanguageInTranscript(transcript) {
+  const t = String(transcript || '').toLowerCase();
+  if (/\b(don'?t quantify|do not quantify|don'?t count)\b/i.test(t)) return false;
+  return /\b(\d+\s*(pieces?|items?|bottles?|bags?|cups?))|(\b(one|two|three|four|five|six|seven|eight|nine|ten|dozen|hundreds)\s+(pieces?|items?|bottles?|separate|distinct))\b/i.test(t)
+    || /\b(about|roughly|at least|over|under|more than|fewer than)\s+\d+/i.test(t);
+}
+
+/**
+ * When the reporter refuses to quantify/count, do not invent size or amount — leave blank so the voice agent asks.
+ */
+function applyQuantificationRefusalOverrides(transcript, o) {
+  if (!transcriptRefusesToQuantify(transcript)) return o;
+  const out = { ...o };
+  if (!hasExplicitSizeLanguageInTranscript(transcript)) out.size_category = '';
+  if (!hasExplicitQuantityLanguageInTranscript(transcript)) out.quantity_band = '';
+  return out;
+}
+
+function normalizeConfidenceToken(v) {
+  const c = String(v || '').toLowerCase();
+  if (c === 'high' || c === 'medium' || c === 'low' || c === 'none') return c;
+  return 'medium';
+}
+
+function buildVoiceClarificationSpeech(fieldsSet, parsedSpeech) {
+  const fromModel = typeof parsedSpeech === 'string' ? parsedSpeech.trim() : '';
+  if (fromModel && fieldsSet.size === 0) return fromModel.slice(0, 500);
+
+  const labels = {
+    waste_type: 'what kind of debris it is, for example plastic, fishing gear, or oil',
+    size_category: 'how big the debris area is compared to a shopping bag, a wheelbarrow, or a long line along the water',
+    quantity_band: 'roughly how many separate pieces you see, or say if it is one clump or patch',
+    spread_layout: 'whether it is mostly one spot, scattered, along the shore, spread over a wide area, or you are not sure',
+  };
+  const keys = [...fieldsSet];
+  if (keys.length === 0) return fromModel ? fromModel.slice(0, 500) : '';
+  const parts = keys.map((k) => labels[k] || k);
+  const base = `I need a bit more detail on ${parts.join(', and on ')}.`;
+  const tail = ' Please answer in short phrases.';
+  const out = `${base}${tail}`.slice(0, 500);
+  return fromModel ? `${fromModel.slice(0, 220)} ${out}`.slice(0, 500) : out;
+}
+
+/**
+ * Map ElevenLabs transcript to strict dropdown values and decide if spoken follow-up is needed.
+ * @param {string} transcript
+ * @param {{ hasPhoto?: boolean, current?: { waste_type?: string, size_category?: string, quantity_band?: string, spread_layout?: string } }} opts
+ */
+export async function inferVoiceReportFieldsFromTranscript(transcript, opts = {}) {
+  const empty = {
+    waste_type: '',
+    size_category: '',
+    quantity_band: '',
+    spread_layout: '',
+    supplemental_notes: '',
+    report_ready: false,
+    clarification_speech: null,
+    infer_skipped: null,
+    fields_needing_clarification: [],
+  };
+  if (!process.env.REACT_APP_GROQ_API_KEY) return { ...empty, infer_skipped: 'no_groq' };
+  const t = String(transcript || '').trim();
+  if (!t) return empty;
+
+  const hasPhoto = Boolean(opts.hasPhoto);
+  const current = opts.current && typeof opts.current === 'object' ? opts.current : {};
+
+  const prompt = `You parse a marine debris field report from SPEECH-TO-TEXT (may have disfluencies). Reply with ONE JSON object only (no markdown).
+
+Current UI selections (empty string means unset). Prefer clear NEW evidence from the transcript; keep a prior value only if the transcript does not contradict it.
+${JSON.stringify({
+    waste_type: String(current.waste_type || ''),
+    size_category: String(current.size_category || ''),
+    quantity_band: String(current.quantity_band || ''),
+    spread_layout: String(current.spread_layout ?? ''),
+  }, null, 2)}
+
+Reporter already attached a photo: ${hasPhoto ? 'yes' : 'no'}
+${hasPhoto ? 'Photo may help downstream CV; still map speech to dropdowns when possible.' : 'Without a photo, waste_type + size_category + quantity_band must all be filled from speech for the report to be complete.'}
+
+TRANSCRIPT:
+"""${t.replace(/"/g, "'").slice(0, 8000)}"""
+
+FEW_SHOT (follow this behavior; transcripts will differ):
+- Example A: "Don't quantify it. I have plastic cups in the ocean." → waste_type "plastic"; size_category "" and quantity_band "" (speaker refused numbers); spread_layout ""; confidence low for size and quantity; fields_needing_clarification must include size_category and quantity_band; supplemental_notes may mention cups/ocean.
+- Example B: "Ghost net maybe twenty meters along the beach, high tide line." → waste_type "fishing_gear"; size_category "Linear debris — tens of meters or more" OR "Linear debris — a few meters" if they said only a few meters; quantity_band "1" or "2–10" if they implied sections; spread_layout "linear_along_shore" when shoreline is explicit.
+- Example C: "Sheen on the water, chemical smell, area the size of a car hood." → waste_type "chemical"; size_category "Single large item (bucket to tire-sized)" or "Pile — fills a shopping bag" for hood-sized patch; quantity "1" if one slick; spread "" unless they say scattered.
+
+CRITICAL GEOMETRY (avoid common speech-to-text mistakes):
+- Mentions of wildlife, birds, seals, fish, etc. do NOT imply debris shape. Ignore them for size/spread/quantity except in supplemental_notes.
+- A "circle", "radius", "round patch", or "X yard/meter radius" describes a **compact PILE or patch**, NOT "linear along shore". Never use size_category containing "Linear debris" unless the speaker clearly describes debris stretched **along the shoreline/water/beach** or a **tide line**.
+- A small circular patch (e.g. a few yards across) → size_category **"Pile — fills a shopping bag"** unless clearly wheelbarrow-sized or larger.
+- If the speaker does **not** explicitly say scattered vs one spot vs along shore vs wide field, set spread_layout to **""** (empty = not sure). Do NOT guess "concentrated" from vague phrases like "circle of trash".
+- If they describe one visible accumulation, patch, or "a circle of debris" **without** an explicit count of many separate items, quantity_band should usually be **"1"** (one coherent patch). Use "2–10" only when they clearly imply several distinct pieces.
+
+REFUSAL:
+- If the speaker says they do NOT want to quantify, count, or estimate (e.g. "don't quantify it"), you MUST leave size_category and quantity_band as **empty strings** unless they immediately give explicit size or count language in the same sentence. Set confidence to "low" for those fields and include them in fields_needing_clarification.
+
+CONFIDENCE:
+- For each of waste_type, size_category, quantity_band assign confidence "high" | "medium" | "low".
+- For spread_layout use "none" when spread_layout is ""; otherwise "high"|"medium"|"low".
+- Use "low" whenever you are guessing from vague wording. "medium" when plausible but not explicit.
+
+CLARIFICATION:
+- fields_needing_clarification: array of field keys (waste_type, size_category, quantity_band, spread_layout) that are still empty OR you set confidence to "low" OR the transcript does not give enough to choose confidently.
+- clarification_speech: one short spoken paragraph (max 55 words), second person, asking ONLY for the items in fields_needing_clarification. If fields_needing_clarification is empty, set clarification_speech to null.
+
+Other rules:
+- Map to EXACT allowed strings below only (no shortened labels).
+- supplemental_notes: wildlife, odor/sheen, time, landmarks — max 350 chars; "" if none.
+
+ALLOWED waste_type:
+${JSON.stringify(WASTE_TYPE_VALUES)}
+
+ALLOWED size_category (copy full string):
+${JSON.stringify(SIZE_VALUES)}
+
+ALLOWED quantity_band:
+${JSON.stringify(QUANTITY_VALUES)}
+
+ALLOWED spread_layout ("" = not sure / skip — use this when spread is not explicit):
+${JSON.stringify(SPREAD_VALUES)}
+
+Return this JSON shape:
+{"waste_type":"","size_category":"","quantity_band":"","spread_layout":"","supplemental_notes":"","confidence":{"waste_type":"high","size_category":"high","quantity_band":"high","spread_layout":"none"},"fields_needing_clarification":[],"clarification_speech":null}`;
+
+  try {
+    const response = await groqTextCompletion(
+      [{ role: 'user', content: prompt }],
+      { responseFormatJson: true, modelChain: voiceInferModelFallbackChain() },
+    );
+    const parsed = parseJSONObjectLoose(response.choices[0].message.content);
+    let waste_type = pickAllowedFormValue(parsed.waste_type, WASTE_TYPE_VALUES);
+    if (!waste_type) waste_type = inferWasteTypeFromSpeechHint(parsed.waste_type) || inferWasteTypeFromSpeechHint(t);
+
+    let size_category = pickAllowedFormValue(parsed.size_category, SIZE_VALUES);
+    if (!size_category) size_category = inferSizeFromSpeechHint(parsed.size_category) || inferSizeFromSpeechHint(t);
+
+    let quantity_band = pickAllowedFormValue(parsed.quantity_band, QUANTITY_VALUES);
+    if (!quantity_band && parsed.quantity_band != null) {
+      const hyphenToEn = String(parsed.quantity_band).trim().replace(/-/g, '\u2013');
+      quantity_band = pickAllowedFormValue(hyphenToEn, QUANTITY_VALUES);
+    }
+    if (!quantity_band) {
+      quantity_band = inferQuantityFromSpeechHint(parsed.quantity_band) || inferQuantityFromSpeechHint(t);
+    }
+
+    let spread_layout = pickAllowedFormValue(parsed.spread_layout, SPREAD_VALUES);
+    let supplemental_notes = typeof parsed.supplemental_notes === 'string'
+      ? parsed.supplemental_notes.trim().slice(0, 400)
+      : '';
+
+    let out = {
+      waste_type,
+      size_category,
+      quantity_band,
+      spread_layout,
+      supplemental_notes,
+    };
+    out = applyCircularPatchGeometryOverrides(t, out);
+    out = applyQuantificationRefusalOverrides(t, out);
+    waste_type = out.waste_type;
+    size_category = out.size_category;
+    quantity_band = out.quantity_band;
+    spread_layout = out.spread_layout;
+    supplemental_notes = out.supplemental_notes;
+
+    const structuralOk = Boolean(waste_type && size_category && quantity_band);
+    const pc = parsed.confidence && typeof parsed.confidence === 'object' ? parsed.confidence : {};
+    const confLevel = (key, val) => {
+      if (!val) return 'low';
+      const raw = pc[key];
+      if (raw == null || raw === '') return 'high';
+      return normalizeConfidenceToken(raw);
+    };
+    const conf = {
+      waste_type: confLevel('waste_type', waste_type),
+      size_category: confLevel('size_category', size_category),
+      quantity_band: confLevel('quantity_band', quantity_band),
+      spread_layout: spread_layout ? confLevel('spread_layout', spread_layout) : 'none',
+    };
+
+    const FIELD_KEYS = ['waste_type', 'size_category', 'quantity_band', 'spread_layout'];
+    const fieldsNeed = new Set();
+    ['waste_type', 'size_category', 'quantity_band'].forEach((k) => {
+      if (!out[k]) fieldsNeed.add(k);
+      else if (conf[k] === 'low') fieldsNeed.add(k);
+    });
+    if (spread_layout && conf.spread_layout === 'low') fieldsNeed.add('spread_layout');
+
+    if (Array.isArray(parsed.fields_needing_clarification)) {
+      parsed.fields_needing_clarification.forEach((x) => {
+        if (!FIELD_KEYS.includes(x)) return;
+        if (x === 'spread_layout' && !out.spread_layout) return;
+        if (!out[x] || conf[x] === 'low') fieldsNeed.add(x);
+      });
+    }
+
+    const report_ready = structuralOk && fieldsNeed.size === 0;
+
+    let clarification_speech = buildVoiceClarificationSpeech(fieldsNeed, parsed.clarification_speech);
+    if (!clarification_speech && !report_ready) {
+      clarification_speech = 'Please briefly say what kind of debris it is, roughly how large it is compared to something familiar, and about how many pieces or how wide the patch is.';
+    }
+    if (report_ready) clarification_speech = null;
+
+    return {
+      waste_type,
+      size_category,
+      quantity_band,
+      spread_layout,
+      supplemental_notes,
+      report_ready,
+      clarification_speech,
+      infer_skipped: null,
+      fields_needing_clarification: [...fieldsNeed],
+    };
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn('Voice form inference skipped:', e?.message || e);
+    return { ...empty, infer_skipped: 'parse_error' };
+  }
+}
+
+const GROQ_IMPACT_JSON_RULES = `Return ONLY valid JSON (no markdown) with exactly:
+{
+  "impact_threat_score": <integer 1-10>,
+  "impact_threat_label": "Low" | "Moderate" | "High" | "Critical",
+  "threat_rationale": "<2-4 sentences>",
+  "responder_report": "<4-8 short sentences, plain language, actionable for field teams>"
+}
+impact_threat_label must align with score (Low 1-3, Moderate 4-5, High 6-7, Critical 8-10).
+impact_threat_score must explicitly reflect waste type, scale (structured + notes + voice), location, prior_assessment, and corc_glider_context (spreading / advection) when present.
+responder_report must be a single condensed operational brief (not bullet labels in JSON — plain sentences).`;
+
+/**
+ * Second-pass Groq assessment: typed notes + ElevenLabs voice transcript + CORC + prior fused scores
+ * → quantified impact_threat_score + responder_report (primary LLM for this step).
+ */
+async function mergeMarineReportWithGroqImpact({
+  latitude,
+  longitude,
+  reporterStructured,
+  typedNotes,
+  voiceTranscript,
+  analysis,
+  pipeline,
+}) {
+  if (!process.env.REACT_APP_GROQ_API_KEY || !analysis) return analysis;
+
+  let corc = null;
+  try {
+    corc = await getNearestGliderCurrent(latitude, longitude);
+  } catch {
+    corc = null;
+  }
+
+  const payload = {
+    location: { latitude, longitude },
+    reporter_structured: reporterStructured || {},
+    typed_field_notes: String(typedNotes || '').trim(),
+    voice_transcription: String(voiceTranscript || '').trim(),
+    corc_glider_context: corc || { note: 'No CORC profile within search radius in precomputed index.' },
+    prior_assessment: {
+      debris_type: analysis.debris_type,
+      density_score: analysis.density_score,
+      density_label: analysis.density_label,
+      intensity_rationale: analysis.intensity_rationale,
+      approximate_size: analysis.approximate_size,
+      quantity_estimate: analysis.quantity_estimate,
+      spread: analysis.spread,
+      estimated_volume: analysis.estimated_volume,
+      confidence: analysis.confidence,
+    },
+    cv_pipeline_summary: pipeline
+      ? {
+        detector: pipeline.detection?.detector,
+        debris_bbox_count: pipeline.detection?.debris?.length ?? 0,
+        animal_bbox_count: pipeline.detection?.animals?.length ?? 0,
+        geo: pipeline.geo || null,
+      }
+      : null,
+  };
+
+  const prompt = `You are ClearMarine's impact and threat assessor for ocean debris and spill response. This pass runs on Groq (text model).
+
+You receive ONE JSON object with: coordinates, structured reporter fields (waste type, size, quantity, spread), typed_field_notes, voice_transcription (ElevenLabs Scribe STT when the reporter used voice — may duplicate phrases in typed_field_notes), corc_glider_context (nearest precomputed CORC/Spray-style current profile when available), prior_assessment from the first-pass debris model, and optional CV bbox counts (not raw pixels).
+
+Integrate the full payload. When voice_transcription is non-empty, treat it as equally authoritative as typed notes for hazards, wildlife, odor/sheen, timing, and local references.
+
+You must output:
+(a) impact_threat_score — single integer 1–10 quantifying operational threat (entanglement, wildlife risk, navigation, chemical/oil severity, spread potential given currents, urgency from voice or notes).
+(b) responder_report — condensed plain-language brief for field responders (what to expect, priorities, how currents may move material).
+
+${GROQ_IMPACT_JSON_RULES}
+
+INPUT JSON:
+${JSON.stringify(payload, null, 2)}`;
+
+  try {
+    const response = await groqTextCompletion([{ role: 'user', content: prompt }]);
+    const parsed = extractJSON(response.choices[0].message.content);
+    const score = Number(parsed.impact_threat_score);
+    const impact_threat_score = Number.isFinite(score)
+      ? Math.max(1, Math.min(10, Math.round(score)))
+      : analysis.density_score;
+    return {
+      ...analysis,
+      impact_threat_score,
+      impact_threat_label: typeof parsed.impact_threat_label === 'string' ? parsed.impact_threat_label.trim() : '',
+      threat_rationale: typeof parsed.threat_rationale === 'string' ? parsed.threat_rationale.trim() : '',
+      responder_report: typeof parsed.responder_report === 'string' ? parsed.responder_report.trim() : '',
+    };
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn('Groq impact assessment skipped:', e?.message || e);
+    return analysis;
+  }
 }
 
 const DEBRIS_TYPE_ENUM = 'plastic | fishing_gear | organic | chemical | mixed | unknown';
@@ -156,65 +628,6 @@ function buildReconciliationAnalysisText(raw, pipeline) {
   return parts.join(' ');
 }
 
-const GEMINI_VISION_MODEL =
-  process.env.REACT_APP_GEMINI_VISION_MODEL || 'gemini-2.0-flash';
-
-/**
- * When COCO-SSD returns no boxes (common underwater), Gemini still sees the photo.
- * Returns null if no API key or the call fails.
- */
-async function runGeminiPhotoVisionPrior(base64Image, mimeType, reporterStructured) {
-  const key = process.env.REACT_APP_GEMINI_API_KEY;
-  if (!key || !base64Image) return null;
-
-  const reporterJson = JSON.stringify(reporterStructured || {}, null, 0);
-  const instruction = `You are looking at ONE photo for marine debris / response triage.
-A separate in-browser model (COCO-SSD) often returns ZERO bounding boxes on underwater shots, nets, and fish schools. Your job is to describe what is actually visible.
-
-Reporter form (may be wrong — compare to the image):
-${reporterJson}
-
-Return ONLY a JSON object (no markdown) with these keys:
-- confidence: "high" | "medium" | "low" — how sure you are about visible scale and debris type.
-- reporter_undersized_vs_scene: boolean — true if the visible debris is clearly much larger / more massive than the reporter size + quantity fields imply (e.g. huge ghost net but form says hand-sized / 1 piece).
-- reporter_oversized_vs_scene: boolean — true only if the form clearly exaggerates vs the image.
-- approximate_size: short English phrase for ops (e.g. "large derelict net spanning several meters in the water column").
-- quantity_estimate: band (e.g. "1 massive entangled structure", "2–10", "dozens of pieces", "100+").
-- spread: one of concentrated | scattered | linear_along_shore | widespread_patch | unknown
-- wildlife_visible: "none" | "few" | "moderate" | "dense_school"
-- wildlife_note: short phrase if any animals visible
-- primary_debris_type: plastic | fishing_gear | organic | chemical | mixed | unknown
-- scene_one_liner: one sentence
-- suggested_severity: integer 1–10 (entanglement hazard, scale, wildlife interaction — be conservative if unsure)`;
-
-  try {
-    const genAI = new GoogleGenerativeAI(key);
-    const model = genAI.getGenerativeModel({
-      model: GEMINI_VISION_MODEL,
-      generationConfig: {
-        temperature: 0.2,
-        maxOutputTokens: 1024,
-        responseMimeType: 'application/json',
-      },
-    });
-
-    const result = await model.generateContent([
-      { inlineData: { mimeType: mimeType || 'image/jpeg', data: base64Image } },
-      { text: instruction },
-    ]);
-
-    const text = result.response.text();
-    if (!text || !text.trim()) return null;
-    const vision = extractJSON(text);
-    if (!vision || typeof vision !== 'object') return null;
-    return vision;
-  } catch (e) {
-    // eslint-disable-next-line no-console
-    console.warn('Gemini vision prior failed:', e?.message || e);
-    return null;
-  }
-}
-
 function mergeVisionWildlifeIntoFinalObjects(finalObjects, vision) {
   const list = Array.isArray(finalObjects) ? [...finalObjects] : [];
   const wv = String(vision?.wildlife_visible || '').toLowerCase();
@@ -268,7 +681,7 @@ function applyVisionPriorToReconciliation(parsed, vision, reporterStructured) {
     }
 
     const kf = Array.isArray(out.key_factors) ? [...out.key_factors] : [];
-    const line = 'Photo vision (Gemini): visible scale exceeds reporter form — scale fields aligned to the image.';
+    const line = 'Photo vision prior: visible scale exceeds reporter form — scale fields aligned to the prior.';
     if (!kf.some((f) => String(f).includes('Photo vision'))) kf.unshift(line);
     out.key_factors = kf;
 
@@ -277,7 +690,7 @@ function applyVisionPriorToReconciliation(parsed, vision, reporterStructured) {
       conflicts.push({
         topic: 'Reporter size/amount vs visible scene',
         resolution:
-          'COCO-SSD had no bbox hits in this frame (typical underwater). Used Gemini photo assessment for scale; kept compatible structured fields for type where applicable.',
+          'COCO-SSD had no bbox hits in this frame (typical underwater). Used photo vision prior for scale where provided; kept compatible structured fields for type where applicable.',
       });
     }
     out.conflicts = conflicts;
@@ -297,7 +710,7 @@ function applyVisionPriorToReconciliation(parsed, vision, reporterStructured) {
 
   // Help downstream copy: intensity should mention vision when we used it
   if (applied && reporterStructured && typeof out.intensity_rationale === 'string') {
-    if (!/gemini|photo vision|vision model/i.test(out.intensity_rationale)) {
+    if (!/photo vision|vision prior|vision model/i.test(out.intensity_rationale)) {
       out.intensity_rationale = `${out.intensity_rationale.trim()} Photo vision overrode undersized reporter scale.`.trim();
     }
   }
@@ -388,7 +801,7 @@ function enforcePerClassCvAttribution(parsed, pipeline) {
 /**
  * LLMs sometimes hallucinate "CV found X" when lists are empty. Fix output deterministically.
  * @param {object} opts
- * @param {boolean} [opts.visualPriorApplied] — Gemini vision already corrected scale; relax confidence cap slightly.
+ * @param {boolean} [opts.visualPriorApplied] — Photo vision prior already corrected scale; relax confidence cap slightly.
  */
 function enforceEmptyCvConsistency(parsed, pipeline, opts = {}) {
   if (!cvPipelineIsEmpty(pipeline)) return { ...parsed };
@@ -441,7 +854,7 @@ function enforceEmptyCvConsistency(parsed, pipeline, opts = {}) {
   const conflicts = Array.isArray(p.conflicts) ? [...p.conflicts] : [];
   if (hadCvSource) {
     const resolution = opts.visualPriorApplied
-      ? 'Removed incorrect CV attribution; bbox lists were empty — scale may use Gemini photo vision where provided.'
+      ? 'Removed incorrect CV attribution; bbox lists were empty — scale may use a photo vision prior where provided.'
       : 'Corrected: no source=cv objects; narrative reflects structured reporter input only.';
     if (!conflicts.some((c) => c && /implied cv|cv boxes|cited cv objects/i.test(String(c.topic || '')))) {
       conflicts.push({
@@ -501,8 +914,8 @@ function mapReconciliationToLegacy(raw, pipeline, reporterStructured = null) {
 }
 
 /**
- * Photo path: in-browser COCO-SSD pipeline JSON + optional Gemini photo pass (when COCO is empty)
- * + structured dropdowns + notes → Groq reconciliation JSON.
+ * Photo path: in-browser COCO-SSD pipeline JSON + structured dropdowns + notes → Groq reconciliation JSON.
+ * (No separate vision LLM — empty CV frames rely on reporter fields + notes.)
  */
 export async function analyzeDebrisPhoto(
   base64Image,
@@ -511,15 +924,13 @@ export async function analyzeDebrisPhoto(
   longitude,
   reporterNotes = '',
   reporterStructured = null,
+  voiceTranscript = '',
 ) {
   const dataUrl = `data:${mimeType};base64,${base64Image}`;
   const pipeline = await runMarineDebrisPipeline(dataUrl, latitude, longitude);
 
   const cvEmpty = cvPipelineIsEmpty(pipeline);
-  let visualPrior = null;
-  if (cvEmpty && process.env.REACT_APP_GEMINI_API_KEY) {
-    visualPrior = await runGeminiPhotoVisionPrior(base64Image, mimeType, reporterStructured);
-  }
+  const visualPrior = null;
 
   const notes = String(reporterNotes || '').slice(0, 6000).replace(/\s+/g, ' ').trim();
   const structuredBlock = formatReporterStructuredBlock(reporterStructured);
@@ -528,11 +939,12 @@ export async function analyzeDebrisPhoto(
     : 'Free-text notes: (none)';
 
   const expertBlock = `${structuredBlock || 'Structured reporter fields: (none — rely on free-text; CV is supplementary if present)\n'}${notesBlock}`;
+  const voicePromptSection = formatVoiceTranscriptForPrompt(voiceTranscript);
 
   const visionBlock = visualPrior
     ? `
 ────────────────────────────
-INPUT C — VISION_PRIOR (Gemini — looks at the same photo; NOT COCO bounding boxes)
+INPUT C — VISION_PRIOR (when present: same photo, not COCO bounding boxes)
 ────────────────────────────
 ${JSON.stringify(visualPrior)}
 If reporter_undersized_vs_scene is true and confidence is "high", treat reporter size/quantity fields as mistaken and align approximate_size, quantity_estimate, spread, severity, and primary_debris_type with this vision JSON. Mention fish/wildlife here when wildlife_visible is not "none" (COCO often misses underwater fish).
@@ -558,12 +970,12 @@ ${visualPrior
       : 'Bbox lists are empty and no VISION_PRIOR — anchor severity and scale primarily on structured reporter fields + notes; bbox CV is supplementary only; keep confidence conservative when evidence is thin.'
     : 'PRIMARY (~0.7): structured reporter fields + free-text notes — debris type, scale, quantity, spread, and operational priority. SUPPORTING (~0.3): bbox CV when present (bottles, bags, birds, people, etc.). CV does not override a coherent reporter narrative for marine-specific debris (nets, slicks, diffuse plastic) unless bbox evidence clearly contradicts; underwater domain mismatch favors reporter.';
 
-  const prompt = `You are a RECONCILIATION engine for marine debris / wildlife risk. You do not see raw pixels yourself — you receive JSON only: reporter fields, COCO-style pipeline output, and sometimes VISION_PRIOR from Gemini on the same image.
+  const prompt = `You are a RECONCILIATION engine for marine debris / wildlife risk. You do not see raw pixels yourself — you receive JSON only: reporter fields, COCO-style pipeline output, and sometimes an optional VISION_PRIOR JSON for the same image.
 
 ────────────────────────────
-INPUT A — EXPERT INPUT (hypothesis: structured + free text)
+INPUT A — EXPERT INPUT (hypothesis: structured + free text + voice when present)
 ────────────────────────────
-${expertBlock}
+${expertBlock}${voicePromptSection}
 
 ${cvEmpty && !visualPrior
     ? 'When bbox lists are empty and there is no VISION_PRIOR, structured fields are the main quantitative signal — do not invent CV sightings.'
@@ -585,7 +997,7 @@ CV structure reminder:
 ────────────────────────────
 CRITICAL RULES
 ────────────────────────────
-1) Expert (structured + notes) is PRIMARY for response scale and debris narrative. CV bbox lists are SUPPORTING evidence — use them to confirm visible objects when classes match; never let generic COCO detections erase a plausible reporter description of fishing gear, oil, or diffuse plastic.
+1) Expert (structured + typed notes + VOICE_TRANSCRIPT when present) is PRIMARY for response scale and debris narrative. CV bbox lists are SUPPORTING evidence — use them to confirm visible objects when classes match; never let generic COCO detections erase a plausible reporter description of fishing gear, oil, or diffuse plastic.
 2) Compare expert claims to CV detections: agreement, partial agreement, or contradiction — weight expert higher when CV is empty or domain-mismatched (underwater, nets).
 3) ${anchorRule}
 4) Examples: Expert "leatherback turtle" + CV "seabird" or generic wildlife → partial match: accept broad animal presence, reject species precision not in CV. Expert "barbed wire" + CV "plastic_line-like" → uncertain debris class; do not assert barbed wire.
@@ -609,7 +1021,17 @@ ${RECONCILIATION_OUTPUT_SCHEMA}`;
   parsed = merged;
   parsed = enforcePerClassCvAttribution(parsed, pipeline);
   parsed = enforceEmptyCvConsistency(parsed, pipeline, { visualPriorApplied: visionApplied });
-  return mapReconciliationToLegacy(parsed, pipeline, reporterStructured);
+  let legacy = mapReconciliationToLegacy(parsed, pipeline, reporterStructured);
+  legacy = await mergeMarineReportWithGroqImpact({
+    latitude,
+    longitude,
+    reporterStructured,
+    typedNotes: notes,
+    voiceTranscript: String(voiceTranscript || '').trim(),
+    analysis: legacy,
+    pipeline,
+  });
+  return legacy;
 }
 
 /** Detect when plain-text notes already contain enough structure (size/material/amount) so we don't block the user. */
@@ -690,20 +1112,33 @@ function normalizeDebrisAnalysis(a, reporterStructured = null) {
 }
 
 // Text-only analysis when no photo is available
-export async function analyzeDebrisText(notes, latitude, longitude, reporterStructured = null) {
+export async function analyzeDebrisText(notes, latitude, longitude, reporterStructured = null, voiceTranscript = '') {
   const raw = (notes || '').trim();
+  const voicePromptSection = formatVoiceTranscriptForPrompt(voiceTranscript);
   const block = formatReporterStructuredBlock(reporterStructured);
   const prompt = `You are a marine debris assessment AI.
 A reporter at coordinates ${latitude}, ${longitude} described this debris sighting.
 ${block ? `${block}\n` : ''}Free-text description:
 "${raw || 'No description provided'}"
-Use every detail they gave. If structured fields give type + size + quantity, use them as the default for scale unless the description clearly contradicts them.
+Use every detail they gave — including any VOICE_TRANSCRIPT block below (ElevenLabs STT). If structured fields give type + size + quantity, use them as the default for scale unless the description or voice clearly contradicts them.
+${voicePromptSection}
 ${DEBRIS_JSON_SCHEMA}`;
 
   const response = await groqTextCompletion([{ role: 'user', content: prompt }]);
   let parsed = extractJSON(response.choices[0].message.content);
-  parsed = applyTextNotesHeuristic(raw, parsed, reporterStructured);
-  return normalizeDebrisAnalysis(parsed, reporterStructured);
+  const combinedForHeuristic = `${raw}\n${String(voiceTranscript || '').trim()}`.trim();
+  parsed = applyTextNotesHeuristic(combinedForHeuristic, parsed, reporterStructured);
+  let out = normalizeDebrisAnalysis(parsed, reporterStructured);
+  out = await mergeMarineReportWithGroqImpact({
+    latitude,
+    longitude,
+    reporterStructured,
+    typedNotes: raw,
+    voiceTranscript: String(voiceTranscript || '').trim(),
+    analysis: out,
+    pipeline: null,
+  });
+  return out;
 }
 
 // Crew assignment + interception suggestions
